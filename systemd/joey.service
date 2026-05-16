@@ -20,6 +20,12 @@ Environment="XAUTHORITY=%h/.Xauthority"
 Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Joey's piper/whisper/onnx libraries spawn threads; let them
 LimitNOFILE=8192
+# Wake-word sensitivity. Higher = stricter (fewer false fires from
+# fan/AC/background voices). 0.75 + 3-frame streak is paranoid;
+# drop JOEY_WAKE_THRESHOLD to 0.65 if you find you have to repeat
+# "hey jarvis" to get a fire.
+Environment="JOEY_WAKE_THRESHOLD=0.75"
+Environment="JOEY_WAKE_FRAMES=3"
 
 [Install]
 WantedBy=graphical-session.target
