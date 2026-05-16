@@ -456,17 +456,24 @@ class OpenClawBrain:
 
 
 class ClaudeCodeBrain:
-    """Uses `claude -p` from the user's Claude Code installation. Streams
-    via `--output-format stream-json` so we get text-delta events as they
-    arrive. Multi-turn handled by capturing session_id and passing
-    `--resume <id>` on follow-up calls.
+    """Full-power Claude Code brain — streams via `--output-format stream-json`
+    AND has the full agent toolset (Read / Write / Edit / Bash / Glob / Grep
+    + any MCP servers the user has configured + skills).
 
-    Latency on Haiku 4.5 with `--effort low` is ~1.5-2s per turn —
-    competitive with Groq, no extra auth, no extra cost since it runs
-    under your existing Claude Code subscription."""
+    Filesystem access: home directory by default (override with
+    JOEY_CLAUDE_DIRS=~/joey:~/project_mdds:...). Runs with
+    `--permission-mode bypassPermissions` so Joey doesn't deadlock on
+    permission prompts. **This means Jarvis can read, edit, delete, and
+    run shell commands anywhere your user can.** That's the explicit
+    design choice — Jarvis is meant to be an agent, not a chatbot.
 
-    DEFAULT_MODEL = "haiku"
-    DEFAULT_EFFORT = "low"   # skip extended thinking — fastest haiku path
+    Multi-turn handled by capturing session_id and passing `--resume <id>`
+    on follow-up calls. Conversation memory persists across turns; new
+    session every 3 min of idle.
+    """
+
+    DEFAULT_MODEL = "haiku"  # JOEY_CLAUDE_MODEL=sonnet for heavier tasks
+    DEFAULT_EFFORT = "low"   # JOEY_CLAUDE_EFFORT=medium for tougher tool use
     IDLE_S = 180.0
 
     def __init__(self) -> None:
@@ -478,32 +485,50 @@ class ClaudeCodeBrain:
             log("brain: idle reset, fresh session.")
             self.session_id = None
 
+    def _allowed_dirs(self) -> list[str]:
+        # JOEY_CLAUDE_DIRS is a colon-separated list of dirs Jarvis can touch.
+        # Default = the user's entire home directory.
+        raw = os.environ.get("JOEY_CLAUDE_DIRS", str(Path.home()))
+        return [d for d in raw.split(":") if d]
+
     def ask(self, user_text: str) -> str:
         return "".join(self.ask_stream(user_text)) or "(empty reply)"
 
     def ask_stream(self, user_text: str):
         self._maybe_reset()
-        cmd = [
-            "claude", "-p",
-            "--model", self.DEFAULT_MODEL,
-            "--effort", self.DEFAULT_EFFORT,
+        model = os.environ.get("JOEY_CLAUDE_MODEL", self.DEFAULT_MODEL)
+        effort = os.environ.get("JOEY_CLAUDE_EFFORT", self.DEFAULT_EFFORT)
+        # IMPORTANT: --add-dir is variadic — it absorbs every positional arg
+        # until the NEXT flag. If we put it last before the prompt, the prompt
+        # is parsed as another directory and claude errors with "Input must be
+        # provided…". So put --add-dir FIRST, followed by other flags.
+        cmd = ["claude", "-p"]
+        for d in self._allowed_dirs():
+            cmd += ["--add-dir", d]
+        cmd += [
+            "--model", model,
+            "--effort", effort,
             "--output-format", "stream-json",
             "--include-partial-messages",
             "--verbose",
+            "--permission-mode", "bypassPermissions",
         ]
         if self.session_id:
             cmd += ["--resume", self.session_id]
         cmd.append(user_text)
-        log(f"$ claude -p stream  model={self.DEFAULT_MODEL}  effort={self.DEFAULT_EFFORT}  "
+        log(f"$ claude -p stream  model={model}  effort={effort}  "
+            f"dirs={self._allowed_dirs()}  "
             f"{'resume' if self.session_id else 'new'}")
 
         t0 = time.time()
+        # Run from $HOME so Claude's working directory makes file paths sane
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            cwd=str(Path.home()),
         )
         first_text_t: float | None = None
         full_text_parts: list[str] = []

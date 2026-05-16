@@ -1611,12 +1611,13 @@ class JoeyApp(QObject):
         self.hud.dismissed.connect(self._on_dismissed)
 
         # Brain backend:
-        #   default = OpenClawBrain    (routes through user's OpenClaw gateway → Haiku 4.5, ~3s/turn)
-        #   claude-haiku → ClaudeCodeBrain (claude -p haiku, streamed, ~2s/turn)
-        #   claude-full  → ClaudeBrain      (original, sonnet, full agent context)
-        #   hermes-api   → HermesAPIBrain   (Nous DeepSeek, reasoning, ~5s/turn)
-        #   hermes-cli   → HermesBrain      (slow `hermes -z` subprocess)
-        backend = os.environ.get("JOEY_BRAIN", "openclaw").lower()
+        #   default = ClaudeCodeBrain  (claude -p haiku, FULL agent tools:
+        #             Read/Write/Edit/Bash/Glob/Grep + MCP, ~3-5s/turn)
+        #   openclaw  → OpenClawBrain   (routes through gateway, text-only inference)
+        #   claude-full → ClaudeBrain   (original, default model)
+        #   hermes-api  → HermesAPIBrain (Nous DeepSeek)
+        #   hermes-cli  → HermesBrain   (slow subprocess)
+        backend = os.environ.get("JOEY_BRAIN", "claude-haiku").lower()
         core.log(f"loading TTS + brain (HUD mode, mic disabled, brain={backend})...")
         self.piper = core.Piper()
         if backend == "claude-haiku":
