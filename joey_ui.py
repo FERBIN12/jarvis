@@ -1408,6 +1408,9 @@ class VoiceWorker(QThread):
             return
 
         while not self._stop:
+            # ──────────────────────────────────────────────────
+            #  Phase A: wait for the wake word "hey jarvis"
+            # ──────────────────────────────────────────────────
             try:
                 woken = self._listen_for_wake()
             except Exception as e:
@@ -1417,40 +1420,54 @@ class VoiceWorker(QThread):
             if not woken or self._stop:
                 continue
 
-            self.wake_detected.emit()
-            self._cycle_done.clear()
+            # ──────────────────────────────────────────────────
+            #  Phase B: conversation loop — once awake, accept
+            #  follow-up turns WITHOUT re-waking until the user
+            #  goes silent (no speech detected → fall back to
+            #  wake-word listening).
+            # ──────────────────────────────────────────────────
+            core.log("voice: conversation OPEN — follow-ups accepted")
+            while not self._stop:
+                self.wake_detected.emit()
+                self._cycle_done.clear()
 
-            # Record + transcribe in one shot. Recorder closes its own stream
-            # before this returns, so no contention with subsequent wake loop.
-            try:
-                audio = self._recorder.record()
-            except Exception as e:
-                self.voice_error.emit(f"record: {e!r}")
-                self._cycle_done.set()
-                continue
+                # Small grace pause so Piper's speaker tail doesn't bleed
+                # into the next recording on slow audio sinks.
+                time.sleep(0.25)
 
-            if audio.size == 0:
-                self.no_speech.emit()
-                self._cycle_done.set()
-                continue
+                try:
+                    audio = self._recorder.record()
+                except Exception as e:
+                    self.voice_error.emit(f"record: {e!r}")
+                    self._cycle_done.set()
+                    break  # → back to wake-word listening
 
-            try:
-                text = self._whisper.transcribe(audio)
-            except Exception as e:
-                self.voice_error.emit(f"whisper: {e!r}")
-                self._cycle_done.set()
-                continue
+                if audio.size == 0:
+                    # No speech captured in this turn → conversation ends.
+                    self.no_speech.emit()
+                    self._cycle_done.set()
+                    core.log("voice: conversation CLOSED (silence) — wake-word mode")
+                    break
 
-            if not text:
-                self.no_speech.emit()
-                self._cycle_done.set()
-                continue
+                try:
+                    text = self._whisper.transcribe(audio)
+                except Exception as e:
+                    self.voice_error.emit(f"whisper: {e!r}")
+                    self._cycle_done.set()
+                    break
 
-            self.transcript_ready.emit(text)
-            # Block until JoeyApp signals the brain + TTS cycle is done. Without
-            # this, we'd loop back into wake detection while the speaker is
-            # playing — Piper's output would trigger the mic and re-fire wake.
-            self._cycle_done.wait()
+                if not text:
+                    self.no_speech.emit()
+                    self._cycle_done.set()
+                    core.log("voice: conversation CLOSED (empty STT) — wake-word mode")
+                    break
+
+                self.transcript_ready.emit(text)
+                # Block until JoeyApp signals brain + TTS done. Without this
+                # the next record() would start while Piper is still playing,
+                # bleeding TTS audio into the user's "next turn".
+                self._cycle_done.wait()
+                # Loop back — start recording the follow-up turn.
 
     def _listen_for_wake(self) -> bool:
         chunk = 1280  # 80ms @ 16kHz — openWakeWord's preferred frame
