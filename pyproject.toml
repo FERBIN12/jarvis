@@ -13,6 +13,7 @@ dependencies = [
     "webrtcvad-wheels>=2.0.14",
     "PySide6>=6.7",
     "python-xlib>=0.33",
+    "psutil>=5.9",
 ]
 
 [build-system]

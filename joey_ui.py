@@ -129,7 +129,8 @@ def _wrap_text(text: str, fm, max_width: int) -> list[str]:
 PALETTES = {
     "hidden":    (QColor(60,  100, 160), QColor(0,   180, 255), QColor(140, 200, 230)),
     "listening": (QColor(0,   180, 255), QColor(130, 235, 255), QColor(220, 240, 255)),
-    "thinking":  (QColor(255, 170, 50),  QColor(255, 215, 100), QColor(255, 235, 180)),
+    # Violet for thinking — replaces the amber/orange.
+    "thinking":  (QColor(140, 80,  255), QColor(195, 130, 255), QColor(225, 200, 255)),
     "speaking":  (QColor(60,  255, 180), QColor(140, 255, 220), QColor(210, 255, 235)),
 }
 
@@ -203,6 +204,11 @@ class JarvisHUD(QWidget):
         self._flicker_target = 1.0
         # Outer rim slider position
         self._rim_phase = 0.0
+
+        # Live telemetry sources (attached by JoeyApp after construction)
+        self._sysmon = None
+        self._voice = None
+        self._brain_info: callable = lambda: {}
 
         self._anim = QTimer(self)
         self._anim.setInterval(33)
@@ -489,6 +495,12 @@ class JarvisHUD(QWidget):
         self._history.insert(0, (user, reply))
         del self._history[6:]
 
+    def attach_telemetry(self, *, sysmon, voice, brain_info) -> None:
+        """Plug in live data sources after JoeyApp wires everything up."""
+        self._sysmon = sysmon
+        self._voice = voice
+        self._brain_info = brain_info
+
     def _palette(self):
         return PALETTES.get(self._state, PALETTES["hidden"])
 
@@ -524,17 +536,23 @@ class JarvisHUD(QWidget):
         #    from the orb and connect to corner panels)
         self._draw_energy_beams(p, cx, cy, accent, W, H)
 
-        # 7) Corner panels (telemetry, subsystems, history, globe)
+        # 7) Corner panels (real-data versions)
         self._draw_panel_telemetry(p, primary, accent, text_color)
         self._draw_panel_subsystems(p, primary, accent, text_color)
         self._draw_panel_history(p, primary, accent, text_color)
-        self._draw_panel_globe(p, primary, accent)
+        self._draw_panel_scope(p, primary, accent)
 
-        # 8) Orb stack (drawn on top of beams so endpoints look attached)
-        self._draw_outer_arc_ring(p, cx, cy, primary, accent, radius=320)
+        # 8) Three INFORMATIONAL arcs around the orb:
+        #    outer  = CPU history per second (60 segments)
+        #    middle = Memory % (filled arc, 0..360°)
+        #    inner  = Network in (upper arc) + out (lower arc)
+        self._draw_arc_cpu(p, cx, cy, primary, accent)
+        self._draw_arc_mem(p, cx, cy, primary, accent)
+        self._draw_arc_net(p, cx, cy, primary, accent)
+
+        # 9) Orb stack: tick marks + REAL audio bars + rings + sphere
         self._draw_tick_marks(p, cx, cy, primary, r_in=290, r_out=302, count=72)
-        self._draw_audio_bars(p, cx, cy, accent, r_base=200, max_len=72)
-        self._draw_mid_ring(p, cx, cy, accent, radius=180)
+        self._draw_audio_bars_real(p, cx, cy, accent, r_base=200, max_len=72)
         self._draw_inner_ring(p, cx, cy, accent, radius=140)
         self._draw_sphere(p, cx, cy, primary, accent, base_r=92)
         self._draw_scan(p, cx, cy, accent, radius=300)
@@ -600,33 +618,49 @@ class JarvisHUD(QWidget):
             p.setBrush(QColor(255, 255, 255, 220))
             p.drawEllipse(QPointF(x, y), 2.5, 2.5)
 
-    # --- vertical spectrum EQ bars on left + right margins ---
+    # --- LEFT margin: live mic amplitude history (last ~28 frames @ 80ms)
+    # --- RIGHT margin: rolling CPU% history (last ~28 seconds)
     def _draw_side_spectrums(self, p: QPainter, accent: QColor, W: int, H: int) -> None:
         bar_w = 4
         gap = 14
-        total = len(self._side_bars_l) * (bar_w + gap) - gap
+        n = 28
+        total = n * (bar_w + gap) - gap
         y0 = (H - total) // 2
         max_h = 130
-        for i, h in enumerate(self._side_bars_l):
-            bh = int(max_h * h)
-            yy = y0 + i * (bar_w + gap) + (bar_w - bar_w) // 2
-            grad = QRadialGradient(QPointF(40, yy + bar_w / 2), bh + 8)
+
+        # LEFT — REAL mic RMS, newest at top so it animates downward
+        mic = list(self._voice.mic_rms_hist[-n:]) if self._voice else [0.0] * n
+        mic += [0.0] * (n - len(mic))
+        for i, h in enumerate(mic):
+            bh = int(max_h * max(0.0, min(1.0, h)))
+            yy = y0 + i * (bar_w + gap)
             alpha = int(120 + 130 * h)
-            grad.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
-            grad.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 30))
-            p.setBrush(grad)
+            p.setBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha))
             p.setPen(Qt.NoPen)
             p.drawRect(QRectF(28, yy, bh, bar_w))
-        for i, h in enumerate(self._side_bars_r):
-            bh = int(max_h * h)
+        # legend
+        self._mini_label(p, 28, y0 - 14, "MIC RMS", accent)
+
+        # RIGHT — REAL CPU history (recent seconds)
+        cpu = list(self._sysmon.cpu_hist[-n:]) if self._sysmon else [0.0] * n
+        cpu += [0.0] * (n - len(cpu))
+        for i, c in enumerate(cpu):
+            bh = int(max_h * max(0.0, min(1.0, c / 100.0)))
             yy = y0 + i * (bar_w + gap)
-            grad = QRadialGradient(QPointF(W - 40, yy + bar_w / 2), bh + 8)
-            alpha = int(120 + 130 * h)
-            grad.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
-            grad.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 30))
-            p.setBrush(grad)
+            alpha = int(120 + 130 * (c / 100.0))
+            p.setBrush(QColor(accent.red(), accent.green(), accent.blue(), alpha))
             p.setPen(Qt.NoPen)
             p.drawRect(QRectF(W - 28 - bh, yy, bh, bar_w))
+        self._mini_label(p, W - 28 - 56, y0 - 14, "CPU 60s", accent, right=True)
+
+    def _mini_label(self, p, x, y, text, accent: QColor, *, right: bool = False) -> None:
+        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(7)
+        p.setFont(f)
+        p.setPen(QColor(accent.red(), accent.green(), accent.blue(), 200))
+        if right:
+            fm = p.fontMetrics()
+            x = x + 56 - fm.horizontalAdvance(text)
+        p.drawText(int(x), int(y), text)
 
     # --- 4 animated dashed beams from orb center to each corner-panel center ---
     def _draw_energy_beams(self, p: QPainter, cx: float, cy: float,
@@ -714,26 +748,32 @@ class JarvisHUD(QWidget):
             p.drawLine(int(x), int(y), int(x + dx * L), int(y))
             p.drawLine(int(x), int(y), int(x), int(y + dy * L))
 
-    # --- LEFT TOP: telemetry panel ---
+    # --- LEFT TOP: REAL system telemetry (psutil) ---
     def _draw_panel_telemetry(self, p: QPainter, primary, accent, text) -> None:
         x, y, w, h = 60, 100, 280, 180
         self._panel_frame(p, x, y, w, h, primary, "TELEMETRY")
-        # Background scrolling tech-text (very faint)
-        self._draw_panel_stream(p, x, y, w, h, self._stream_lines_left, accent)
         f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(9)
         p.setFont(f)
         p.setPen(text)
-        amp_avg = sum(self._bars) / len(self._bars)
-        rows = [
-            f"FREQ      16000 Hz",
-            f"CHANNELS  01",
-            f"AMP       {amp_avg*100:6.2f}%",
-            f"CPU       {(12 + (self._tick_n % 25)):>3d}%",
-            f"MEM       {(47 + (self._tick_n % 13)):>3d}%",
-            f"UPTIME    {self._tick_n // 30:>04d}s",
-        ]
-        for i, r in enumerate(rows):
-            p.drawText(x + 16, y + 60 + i * 18, r)
+        sm = self._sysmon
+        rows = []
+        if sm:
+            cpu = sm.cpu_hist[-1] if sm.cpu_hist else 0.0
+            rows.append(f"CPU       {cpu:6.1f}%")
+            rows.append(f"MEM       {sm.mem_pct:6.1f}%")
+            rows.append(f"NET ↓     {sm.net_in_kbps:8.1f} KB/s")
+            rows.append(f"NET ↑     {sm.net_out_kbps:8.1f} KB/s")
+            rows.append(f"DISK r/w  {sm.disk_read_kbps:.0f}/{sm.disk_write_kbps:.0f}")
+            if sm.temp_c is not None:
+                rows.append(f"TEMP      {sm.temp_c:5.1f} °C")
+            if sm.batt_pct is not None:
+                chg = "⚡" if sm.batt_charging else "  "
+                rows.append(f"BATT  {chg} {sm.batt_pct:5.1f}%")
+            rows.append(f"PROCS     {sm.process_count:>5d}")
+        else:
+            rows = ["(sysmon offline)"]
+        for i, r in enumerate(rows[:7]):
+            p.drawText(x + 16, y + 50 + i * 16, r)
         # mini amp bar
         bar_x = x + 16; bar_y = y + h - 22; bar_w = w - 32; bar_h = 8
         p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 80), 1))
@@ -742,34 +782,42 @@ class JarvisHUD(QWidget):
         p.fillRect(bar_x, bar_y, fill, bar_h,
                    QColor(accent.red(), accent.green(), accent.blue(), 180))
 
-    # --- RIGHT TOP: subsystems panel ---
+    # --- RIGHT TOP: REAL Joey state ---
     def _draw_panel_subsystems(self, p: QPainter, primary, accent, text) -> None:
         W = self.width()
         w, h = 280, 180
         x, y = W - w - 60, 100
         self._panel_frame(p, x, y, w, h, primary, "SUBSYSTEMS")
-        self._draw_panel_stream(p, x, y, w, h, self._stream_lines_right, accent)
         f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(9)
         p.setFont(f)
+
+        bi = self._brain_info() if self._brain_info else {}
+        v = self._voice
+        last_score = v.last_wake_score if v else 0.0
+        peak = v.mic_peak if v else 0.0
+        latency = bi.get("last_latency_s", 0.0)
+        turns = bi.get("turns", 0)
+        brain = bi.get("name", "?")
+
         rows = [
-            ("BRAIN", "HERMES", True),
-            ("VOICE", "ARMED", True),
-            ("WAKE",  "JARVIS", True),
-            ("STT",   "WHISPER", True),
-            ("TTS",   "PIPER", True),
-            ("MCP",   "STBY", False),
+            ("BRAIN",   brain.upper(),                              True),
+            ("LATENCY", f"{latency*1000:>4.0f} ms" if latency else "—", latency > 0),
+            ("TURNS",   f"{turns}",                                  True),
+            ("WAKE",    f"{last_score:.2f} / {core.WAKE_THRESHOLD:.2f}", last_score >= 0.0),
+            ("MIC PK",  f"{peak*100:5.1f}%",                         True),
+            ("STT",     "WHISPER base.en",                           True),
+            ("TTS",     "PIPER amy-medium",                          True),
         ]
-        for i, (k, v, ok) in enumerate(rows):
-            yy = y + 60 + i * 18
+        for i, (k, vstr, ok) in enumerate(rows):
+            yy = y + 50 + i * 16
             p.setPen(text)
-            p.drawText(x + 16, yy, f"{k:<7s}")
-            ok_col = QColor(80, 255, 160, 230) if ok else QColor(255, 180, 60, 200)
-            p.setPen(ok_col)
-            p.drawText(x + 96, yy, v)
-            # status dot
+            p.drawText(x + 16, yy, f"{k:<8s}")
+            ok_col = QColor(80, 255, 160, 230) if ok else QColor(255, 100, 100, 200)
+            p.setPen(QColor(220, 240, 255, 230))
+            p.drawText(x + 100, yy, vstr)
             p.setBrush(ok_col)
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QPointF(x + w - 24, yy - 4), 3, 3)
+            p.drawEllipse(QPointF(x + w - 18, yy - 4), 3, 3)
 
     # --- LEFT BOTTOM: history panel ---
     def _draw_panel_history(self, p: QPainter, primary, accent, text) -> None:
@@ -789,7 +837,41 @@ class JarvisHUD(QWidget):
             p.setPen(QColor(text.red(), text.green(), text.blue(), 130))
             p.drawText(x + 16, yy + 11, f"  {r[:34]}")
 
-    # --- RIGHT BOTTOM: wireframe globe ---
+    # --- RIGHT BOTTOM: real-time mic waveform scope ---
+    def _draw_panel_scope(self, p: QPainter, primary, accent) -> None:
+        W = self.width(); H = self.height()
+        w, h = 280, 160
+        x, y = W - w - 60, H - 280
+        self._panel_frame(p, x, y, w, h, primary, "MIC // SCOPE")
+        # baseline
+        baseline = y + h / 2 + 8
+        # axis line
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 80), 1))
+        p.drawLine(int(x + 14), int(baseline), int(x + w - 14), int(baseline))
+        # waveform from voice.mic_rms_hist — 60 most recent
+        mic = list(self._voice.mic_rms_hist[-60:]) if self._voice else []
+        if len(mic) < 2:
+            return
+        path_w = w - 28
+        amp_h = (h - 50) / 2
+        pen = QPen(accent, 2)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        prev_x = x + 14
+        prev_y = baseline
+        for i, m in enumerate(mic):
+            xx = x + 14 + (i / max(1, len(mic) - 1)) * path_w
+            yy = baseline - m * amp_h
+            p.drawLine(QPointF(prev_x, prev_y), QPointF(xx, yy))
+            prev_x, prev_y = xx, yy
+        # numeric current level top-right
+        cur = mic[-1] if mic else 0.0
+        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(8)
+        p.setFont(f)
+        p.setPen(accent)
+        p.drawText(x + w - 80, y + h - 12, f"RMS {cur*100:5.1f}%")
+
+    # --- RIGHT BOTTOM (legacy): wireframe globe (kept but unused; can revive) ---
     def _draw_panel_globe(self, p: QPainter, primary, accent) -> None:
         W = self.width(); H = self.height()
         w, h = 280, 160
@@ -892,22 +974,112 @@ class JarvisHUD(QWidget):
             ))
             p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
-    # --- audio bars (scaled) ---
-    def _draw_audio_bars(self, p, cx, cy, accent, r_base=200, max_len=72) -> None:
-        n = len(self._bars)
-        for i, h in enumerate(self._bars):
-            ang = i * (math.pi * 2 / n)
+    # --- audio bars driven by REAL mic amplitude history (newest at top) ---
+    def _draw_audio_bars_real(self, p, cx, cy, accent, r_base=200, max_len=72) -> None:
+        n = 96
+        mic = list(self._voice.mic_rms_hist[-n:]) if self._voice else []
+        # Pad/repeat so the circle is full
+        while len(mic) < n:
+            mic.insert(0, 0.0)
+        # Add a small idle baseline so bars don't disappear entirely
+        baseline = {"listening": 0.10, "speaking": 0.15}.get(self._state, 0.06)
+        for i, h in enumerate(mic):
+            h = max(baseline, min(1.0, h))
+            ang = i * (math.pi * 2 / n) - math.pi / 2  # start at top
             r1 = r_base
             r2 = r_base + max_len * h
             x1 = cx + math.cos(ang) * r1
             y1 = cy + math.sin(ang) * r1
             x2 = cx + math.cos(ang) * r2
             y2 = cy + math.sin(ang) * r2
-            alpha = int(120 + 130 * h)
+            alpha = int(110 + 140 * h)
             pen = QPen(QColor(accent.red(), accent.green(), accent.blue(), alpha), 2.6)
             pen.setCapStyle(Qt.RoundCap)
             p.setPen(pen)
             p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+    # --- OUTER ARC: per-second CPU history (60 segments around the orb) ---
+    def _draw_arc_cpu(self, p, cx, cy, primary: QColor, accent: QColor) -> None:
+        radius = 320
+        rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
+        # Background full ring (faint)
+        p.setPen(QPen(QColor(primary.red(), primary.green(), primary.blue(), 60), 2))
+        p.drawArc(rect, 0, 360 * 16)
+        # 60 segments — one per second of CPU history
+        cpu = list(self._sysmon.cpu_hist[-60:]) if self._sysmon else [0.0] * 60
+        cpu = [0.0] * (60 - len(cpu)) + cpu
+        seg_deg = 360.0 / 60
+        for i, c in enumerate(cpu):
+            t = c / 100.0
+            if t < 0.02:
+                continue
+            # rotate so newest is at top (12 o'clock)
+            start_deg = 90 - (i + 1) * seg_deg
+            alpha = int(140 + 110 * min(1.0, t))
+            # height of segment grows with CPU%
+            seg_r_outer = radius + int(14 * min(1.0, t))
+            seg_rect = QRectF(cx - seg_r_outer, cy - seg_r_outer,
+                              2 * seg_r_outer, 2 * seg_r_outer)
+            p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), alpha), 4))
+            p.drawArc(seg_rect, int(start_deg * 16), int((seg_deg - 1.5) * 16))
+        # Current CPU value text top-right of the ring
+        self._arc_label(p, cx + radius - 70, cy - radius + 6,
+                        f"CPU {cpu[-1]:5.1f}%", accent)
+
+    # --- MIDDLE ARC: memory % as a single filled arc ---
+    def _draw_arc_mem(self, p, cx, cy, primary: QColor, accent: QColor) -> None:
+        radius = 250
+        rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
+        # background ring
+        p.setPen(QPen(QColor(primary.red(), primary.green(), primary.blue(), 80), 2))
+        p.drawArc(rect, 0, 360 * 16)
+        pct = self._sysmon.mem_pct if self._sysmon else 0.0
+        span_deg = int(360 * pct / 100.0)
+        # 12 o'clock start, sweep clockwise
+        pen = QPen(accent, 4)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(rect, 90 * 16, -span_deg * 16)
+        self._arc_label(p, cx - radius + 12, cy - radius + 6,
+                        f"MEM {pct:5.1f}%", accent)
+
+    # --- INNER ARC: network in/out as opposing half-arcs ---
+    def _draw_arc_net(self, p, cx, cy, primary: QColor, accent: QColor) -> None:
+        radius = 200
+        rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
+        p.setPen(QPen(QColor(primary.red(), primary.green(), primary.blue(), 60), 1.5))
+        p.drawArc(rect, 0, 360 * 16)
+        if not self._sysmon:
+            return
+        net_in = self._sysmon.net_in_kbps
+        net_out = self._sysmon.net_out_kbps
+        # Map to angular span — log-scale, cap at ~2MB/s = full span
+        def to_span(kbps: float) -> int:
+            x = min(1.0, math.log10(max(1.0, kbps)) / 3.3)  # 0..1
+            return int(180 * x)
+        in_span = to_span(net_in)
+        out_span = to_span(net_out)
+        # Upper half = down/in (cyan-ish bright)
+        pen_in = QPen(accent, 3)
+        p.setPen(pen_in)
+        p.drawArc(rect, (180 - in_span // 2) * 16, in_span * 16)
+        # Lower half = up/out (slightly dim)
+        pen_out = QPen(QColor(accent.red(), accent.green(), accent.blue(), 180), 3)
+        p.setPen(pen_out)
+        p.drawArc(rect, (360 - out_span // 2) * 16, out_span * 16)
+        # Labels
+        self._arc_label(p, cx - radius - 4, cy + 2, f"↓ {net_in:6.1f} KB/s", accent, right=True)
+        self._arc_label(p, cx + radius + 8, cy + 2, f"↑ {net_out:6.1f} KB/s", accent)
+
+    def _arc_label(self, p, x, y, text, accent, *, right: bool = False) -> None:
+        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(accent.red(), accent.green(), accent.blue(), 220))
+        if right:
+            fm = p.fontMetrics()
+            x -= fm.horizontalAdvance(text)
+        p.drawText(int(x), int(y), text)
 
     # --- mid ring (scaled, dashed) ---
     def _draw_mid_ring(self, p, cx, cy, accent, radius=180) -> None:
@@ -1124,6 +1296,72 @@ class TriggerSocket(QObject):
         self.triggered.emit()
 
 
+# ---------- real system telemetry (psutil + battery) ----------
+class SystemMonitor(QThread):
+    """Samples real OS metrics at 1Hz and keeps short rolling histories.
+    The HUD reads from this for the informational arcs."""
+
+    HIST_LEN = 60  # 60 seconds of history per metric
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stop = False
+        import psutil  # noqa: F401 — confirmed at import time
+        self.cpu_hist: list[float] = [0.0] * self.HIST_LEN
+        self.mem_pct: float = 0.0
+        self.net_in_kbps: float = 0.0
+        self.net_out_kbps: float = 0.0
+        self.disk_read_kbps: float = 0.0
+        self.disk_write_kbps: float = 0.0
+        self.temp_c: float | None = None
+        self.batt_pct: float | None = None
+        self.batt_charging: bool = False
+        self.process_count: int = 0
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        import psutil
+        prev_net = psutil.net_io_counters()
+        prev_disk = psutil.disk_io_counters()
+        prev_t = time.time()
+        while not self._stop:
+            cpu = psutil.cpu_percent(interval=1)  # blocks 1s — natural pacing
+            now = time.time()
+            dt = max(1e-3, now - prev_t)
+            self.cpu_hist.append(cpu)
+            del self.cpu_hist[: max(0, len(self.cpu_hist) - self.HIST_LEN)]
+            self.mem_pct = psutil.virtual_memory().percent
+
+            net = psutil.net_io_counters()
+            self.net_in_kbps = (net.bytes_recv - prev_net.bytes_recv) / dt / 1024
+            self.net_out_kbps = (net.bytes_sent - prev_net.bytes_sent) / dt / 1024
+            prev_net = net
+
+            disk = psutil.disk_io_counters()
+            if disk and prev_disk:
+                self.disk_read_kbps = (disk.read_bytes - prev_disk.read_bytes) / dt / 1024
+                self.disk_write_kbps = (disk.write_bytes - prev_disk.write_bytes) / dt / 1024
+            prev_disk = disk
+
+            try:
+                temps = psutil.sensors_temperatures()
+                pkg = (temps.get("coretemp") or temps.get("k10temp") or [])
+                self.temp_c = pkg[0].current if pkg else None
+            except Exception:
+                self.temp_c = None
+            try:
+                b = psutil.sensors_battery()
+                if b is not None:
+                    self.batt_pct = b.percent
+                    self.batt_charging = bool(b.power_plugged)
+            except Exception:
+                pass
+            self.process_count = len(psutil.pids())
+            prev_t = now
+
+
 # ---------- voice worker thread ----------
 class VoiceWorker(QThread):
     """Background loop: wake-word → record → Whisper STT → emit transcript.
@@ -1144,6 +1382,10 @@ class VoiceWorker(QThread):
         self._wake = None
         self._recorder = None
         self._whisper = None
+        # Live audio level history (rolling) + last wake score — for the HUD
+        self.mic_rms_hist: list[float] = [0.0] * 60
+        self.last_wake_score: float = 0.0
+        self.mic_peak: float = 0.0
 
     def signal_cycle_done(self) -> None:
         """Called from main thread when brain/TTS phase finished — voice may listen again."""
@@ -1211,8 +1453,6 @@ class VoiceWorker(QThread):
 
     def _listen_for_wake(self) -> bool:
         chunk = 1280  # 80ms @ 16kHz — openWakeWord's preferred frame
-        # Require WAKE_CONSECUTIVE_FRAMES above threshold to suppress
-        # one-frame false positives from background noise.
         streak = 0
         with sd.RawInputStream(
             samplerate=16000, blocksize=chunk, dtype="int16", channels=1
@@ -1220,12 +1460,19 @@ class VoiceWorker(QThread):
             while not self._stop:
                 data, _ = stream.read(chunk)
                 pcm = np.frombuffer(bytes(data), dtype=np.int16)
+                # Live audio level — normalized RMS [0..1] over this 80ms frame
+                rms = float(np.sqrt(np.mean(pcm.astype(np.float32) ** 2))) / 32768.0
+                self.mic_rms_hist.append(min(1.0, rms * 4.0))  # ×4 makes voice
+                del self.mic_rms_hist[: max(0, len(self.mic_rms_hist) - 60)]
+                self.mic_peak = max(self.mic_peak * 0.92, float(np.abs(pcm).max()) / 32768.0)
+
                 preds = self._wake.model.predict(pcm)
                 top_score = 0.0
                 top_name = ""
                 for name, score in preds.items():
                     if score > top_score:
                         top_score, top_name = score, name
+                self.last_wake_score = float(top_score)
                 if top_score >= core.WAKE_THRESHOLD:
                     streak += 1
                     if streak >= core.WAKE_CONSECUTIVE_FRAMES:
@@ -1406,6 +1653,21 @@ class JoeyApp(QObject):
         else:
             self.voice = None
 
+        # Real system telemetry — sampled at 1Hz in the background
+        self.sysmon = SystemMonitor()
+        self.sysmon.start()
+        # Track brain stats for the HUD
+        self._brain_name = backend
+        self._brain_last_latency_s: float = 0.0
+        self._brain_turn_count: int = 0
+        self.worker.state.connect(self._on_state_for_stats)
+        # Inject everything into the HUD for paint-time consumption
+        self.hud.attach_telemetry(
+            sysmon=self.sysmon,
+            voice=self.voice,
+            brain_info=self._brain_info_cb,
+        )
+
         core.log("joey HUD ready.")
         core.log(f"trigger socket: {SOCK_PATH}")
 
@@ -1450,8 +1712,24 @@ class JoeyApp(QObject):
 
     def _on_reply(self, text: str) -> None:
         self.hud.set_reply(text)
+        self._brain_turn_count += 1
         if getattr(self, "_last_user", None):
             self.hud.push_history(self._last_user, text)
+
+    def _on_state_for_stats(self, state: str, _status: str) -> None:
+        if state == "thinking":
+            self._thinking_started = time.time()
+        elif state == "speaking":
+            t0 = getattr(self, "_thinking_started", None)
+            if t0:
+                self._brain_last_latency_s = time.time() - t0
+
+    def _brain_info_cb(self) -> dict:
+        return {
+            "name": self._brain_name,
+            "last_latency_s": self._brain_last_latency_s,
+            "turns": self._brain_turn_count,
+        }
 
     def _auto_hide(self) -> None:
         # Conversation continues. If the user came in by voice, keep wake-word
@@ -1485,6 +1763,9 @@ def main() -> None:
     if j.voice is not None:
         j.voice.stop()
         j.voice.wait(2000)
+    if hasattr(j, "sysmon"):
+        j.sysmon.stop()
+        j.sysmon.wait(2000)
     sys.exit(rc)
 
 
