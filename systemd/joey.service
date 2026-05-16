@@ -1,0 +1,25 @@
+[Unit]
+Description=JARVIS — voice-first AI agent overlay
+# Wait until graphical session is up — Joey is an X11 Qt app and needs a display
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/joey
+ExecStart=%h/joey/run.sh
+# Restart if Joey crashes (but throttle so a broken state doesn't loop forever)
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=4
+# Pass display env explicitly so Qt finds X11
+Environment="DISPLAY=:1"
+Environment="XAUTHORITY=%h/.Xauthority"
+# Keep PATH visible to the script
+Environment="PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Joey's piper/whisper/onnx libraries spawn threads; let them
+LimitNOFILE=8192
+
+[Install]
+WantedBy=graphical-session.target

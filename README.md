@@ -6,6 +6,8 @@ Hermes-Agent-backed, with an Iron-Man-inspired HUD that fades in over your scree
 Press `Ctrl+Space` for **silent text mode** (meeting-safe — read the reply, no
 audio out). Say **"hey jarvis"** for the full voice loop (mic → STT → agent → TTS).
 
+![JARVIS demo](docs/demo.gif)
+
 > Built as a stepping-stone toward a long-term goal: a physical AI robot for
 > personal task automation. JARVIS develops the voice/agent layer; the brain
 > is intentionally Hermes Agent so skills and procedural memory will accumulate
@@ -60,6 +62,17 @@ bash scripts/download_models.sh
 # 7. Launch
 ./run.sh
 ```
+
+### Auto-start on login (optional)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/joey.service ~/.config/systemd/user/joey.service
+systemctl --user daemon-reload
+systemctl --user enable --now joey.service
+```
+
+Manage it with `systemctl --user {status,restart,stop,disable} joey` and tail logs via `journalctl --user -u joey -f`.
 
 You should see:
 ```
