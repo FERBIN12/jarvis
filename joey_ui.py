@@ -1044,15 +1044,19 @@ class JoeyApp(QObject):
         self.hud.user_text_submitted.connect(self.on_submit_text)
         self.hud.dismissed.connect(self._on_dismissed)
 
-        # Brain backend: Hermes Agent by default (procedural memory, skill
-        # accumulation, MCP-native). Set JOEY_BRAIN=claude to fall back.
-        backend = os.environ.get("JOEY_BRAIN", "hermes").lower()
+        # Brain backend:
+        #   default = HermesAPIBrain (direct Nous HTTPS, ~1-2s/turn)
+        #   JOEY_BRAIN=hermes-cli  → slow `hermes -z` subprocess (~5-10s/turn)
+        #   JOEY_BRAIN=claude      → claude -p
+        backend = os.environ.get("JOEY_BRAIN", "hermes-api").lower()
         core.log(f"loading TTS + brain (HUD mode, mic disabled, brain={backend})...")
         self.piper = core.Piper()
         if backend == "claude":
             self.brain = core.ClaudeBrain()
-        else:
+        elif backend == "hermes-cli":
             self.brain = core.HermesBrain()
+        else:
+            self.brain = core.HermesAPIBrain()
         self.worker = BrainWorker(self.brain, self.piper)
         self.worker.state.connect(self._on_state)
         self.worker.transcript.connect(self._on_transcript)
