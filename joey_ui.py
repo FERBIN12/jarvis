@@ -774,11 +774,12 @@ class JarvisHUD(QWidget):
             rows = ["(sysmon offline)"]
         for i, r in enumerate(rows[:7]):
             p.drawText(x + 16, y + 50 + i * 16, r)
-        # mini amp bar
+        # CPU mini-bar at the panel's bottom (matches the leftmost row label)
+        cpu_now = (sm.cpu_hist[-1] / 100.0) if (sm and sm.cpu_hist) else 0.0
         bar_x = x + 16; bar_y = y + h - 22; bar_w = w - 32; bar_h = 8
         p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 80), 1))
         p.drawRect(bar_x, bar_y, bar_w, bar_h)
-        fill = int(bar_w * min(amp_avg * 2.5, 1.0))
+        fill = int(bar_w * min(cpu_now, 1.0))
         p.fillRect(bar_x, bar_y, fill, bar_h,
                    QColor(accent.red(), accent.green(), accent.blue(), 180))
 
