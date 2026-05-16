@@ -1431,9 +1431,10 @@ class VoiceWorker(QThread):
                 self.wake_detected.emit()
                 self._cycle_done.clear()
 
-                # Small grace pause so Piper's speaker tail doesn't bleed
-                # into the next recording on slow audio sinks.
-                time.sleep(0.25)
+                # Grace pause so any residual speaker echo / room reverb dies
+                # before the recorder starts. Critical to prevent feedback
+                # (Joey hearing its own TTS as user speech).
+                time.sleep(1.5)
 
                 try:
                     audio = self._recorder.record()
@@ -1538,6 +1539,24 @@ class BrainWorker(QThread):
             sd.stop()
         except Exception:
             pass
+        # Make sure mic isn't left muted if we cancel mid-speech
+        self._mute_default_source(False)
+
+    @staticmethod
+    def _mute_default_source(mute: bool) -> bool:
+        """Mute/unmute the default mic source via pactl so Piper's TTS output
+        doesn't echo back into the wake-word listener and trigger a feedback
+        loop. Returns True on success (so callers know whether to unmute)."""
+        import subprocess
+        try:
+            subprocess.run(
+                ["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "1" if mute else "0"],
+                capture_output=True, timeout=2, check=False,
+            )
+            return True
+        except Exception as e:
+            core.log(f"mic mute toggle failed: {e!r}")
+            return False
 
     def stop(self) -> None:
         self._stop = True
@@ -1559,6 +1578,7 @@ class BrainWorker(QThread):
             full_raw = ""
             sentence_buf = ""
             spoke_anything = False
+            _mic_was_muted = self._mute_default_source(True) if speak else False
             try:
                 if hasattr(self.brain, "ask_stream"):
                     for chunk in self.brain.ask_stream(prompt):
@@ -1613,6 +1633,9 @@ class BrainWorker(QThread):
                 # Silent mode — just show the state for the visual + final text
                 self.state.emit("speaking", "// REPLY (silent)")
                 self.reply.emit(_strip_markdown(full_raw))
+            elif _mic_was_muted:
+                # Unmute the mic now that Piper is done playing.
+                self._mute_default_source(False)
 
             self.finished_speaking.emit()
 
