@@ -282,31 +282,89 @@ class HermesAPIBrain:
             return _do()
 
     def ask(self, user_text: str) -> str:
+        # Non-streaming convenience; collect all chunks.
+        return "".join(self.ask_stream(user_text)) or "(empty reply)"
+
+    def ask_stream(self, user_text: str):
+        """Yield incremental reply chunks (strings) as they arrive from the
+        model. Callers can dispatch each completed sentence to TTS the moment
+        it's ready, so audio can start before the model finishes thinking."""
+        import urllib.error
+        import urllib.request
+
         if self.messages and (time.time() - self.last_used) > self.IDLE_S:
             log("brain: idle reset, fresh session.")
             self.messages = []
         self.messages.append({"role": "user", "content": user_text})
         model = self._resolve_model()
-        log(f"$ POST chat/completions  model={model}  msgs={len(self.messages)}")
+        log(f"$ POST chat/completions (stream)  model={model}  msgs={len(self.messages)}")
+        payload = {
+            "model": model,
+            "messages": self.messages,
+            "max_tokens": self.MAX_TOKENS,
+            "stream": True,
+        }
+
+        def _do_stream():
+            auth = self._load_auth()
+            req = urllib.request.Request(
+                auth["inference_base_url"] + "/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {auth['agent_key']}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                method="POST",
+            )
+            return urllib.request.urlopen(req, timeout=60)
+
         t0 = time.time()
+        reply_parts: list[str] = []
         try:
-            data = self._post_chat({
-                "model": model,
-                "messages": self.messages,
-                "max_tokens": self.MAX_TOKENS,
-            })
+            try:
+                resp = _do_stream()
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    log("brain: 401 — refreshing agent_key via hermes status…")
+                    self._refresh_via_hermes()
+                    resp = _do_stream()
+                else:
+                    raise
+            first_chunk_t: float | None = None
+            with resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload_str = line[5:].strip()
+                    if payload_str == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        delta = ev["choices"][0].get("delta") or {}
+                    except (KeyError, IndexError):
+                        continue
+                    chunk = delta.get("content")
+                    if not chunk:
+                        continue
+                    if first_chunk_t is None:
+                        first_chunk_t = time.time()
+                        log(f"brain: first token at {first_chunk_t - t0:.2f}s")
+                    reply_parts.append(chunk)
+                    yield chunk
         except Exception as e:
-            self.messages.pop()  # rollback so failed turn doesn't poison history
-            return f"API error: {e}"
-        dt = time.time() - t0
-        try:
-            reply = data["choices"][0]["message"].get("content") or ""
-        except (KeyError, IndexError):
-            reply = ""
-        log(f"brain: {dt:.2f}s  ({len(reply)} chars)")
-        self.messages.append({"role": "assistant", "content": reply})
+            self.messages.pop()  # rollback
+            yield f"(API error: {e})"
+            return
+
+        full = "".join(reply_parts)
+        log(f"brain: total {time.time() - t0:.2f}s  ({len(full)} chars)")
+        self.messages.append({"role": "assistant", "content": full})
         self.last_used = time.time()
-        return reply or "(empty reply)"
 
 
 class HermesBrain:

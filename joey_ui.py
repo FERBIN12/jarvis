@@ -66,6 +66,7 @@ _MD_HRULE   = re.compile(r"^[-*_]{3,}\s*$", re.MULTILINE)
 _MD_QUOTE   = re.compile(r"^>\s?", re.MULTILINE)
 _MD_LIST    = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 _MD_BLANK3  = re.compile(r"\n{3,}")
+_SENT_END   = re.compile(r"[.!?\n](?:\s|$)")
 
 
 def _strip_markdown(text: str) -> str:
@@ -1029,22 +1030,65 @@ class BrainWorker(QThread):
                 continue
             self.transcript.emit(prompt)
             self.state.emit("thinking", "// PROCESSING")
+
+            full_raw = ""
+            sentence_buf = ""
+            spoke_anything = False
             try:
-                raw_reply = self.brain.ask(prompt)
+                if hasattr(self.brain, "ask_stream"):
+                    for chunk in self.brain.ask_stream(prompt):
+                        if self._cancelled:
+                            break
+                        full_raw += chunk
+                        sentence_buf += chunk
+                        # Update HUD progressively so user sees text appearing
+                        self.reply.emit(_strip_markdown(full_raw))
+                        # Emit complete sentences to Piper as soon as we have them
+                        if speak:
+                            while True:
+                                m = _SENT_END.search(sentence_buf)
+                                if not m:
+                                    break
+                                sentence = sentence_buf[: m.end()].strip()
+                                sentence_buf = sentence_buf[m.end():]
+                                clean = _strip_markdown(sentence)
+                                if clean and not self._cancelled:
+                                    if not spoke_anything:
+                                        self.state.emit("speaking", "// RESPONDING")
+                                        spoke_anything = True
+                                    try:
+                                        self.piper.speak(clean)
+                                    except Exception as e:
+                                        core.log(f"piper error: {e!r}")
+                    # trailing partial
+                    if speak and sentence_buf.strip() and not self._cancelled:
+                        clean = _strip_markdown(sentence_buf)
+                        if clean:
+                            if not spoke_anything:
+                                self.state.emit("speaking", "// RESPONDING")
+                            try:
+                                self.piper.speak(clean)
+                            except Exception as e:
+                                core.log(f"piper error: {e!r}")
+                else:
+                    # Non-streaming fallback (Claude / hermes-cli)
+                    full_raw = self.brain.ask(prompt)
+                    clean = _strip_markdown(full_raw)
+                    self.reply.emit(clean)
+                    if speak and not self._cancelled:
+                        self.state.emit("speaking", "// RESPONDING")
+                        try:
+                            self.piper.speak(clean)
+                        except Exception as e:
+                            core.log(f"piper error: {e!r}")
             except Exception as e:
-                raw_reply = f"(error: {e})"
-            clean_reply = _strip_markdown(raw_reply)
-            if self._cancelled:
-                self.finished_speaking.emit()
-                continue
-            status = "// RESPONDING" if speak else "// REPLY (silent)"
-            self.state.emit("speaking", status)
-            self.reply.emit(clean_reply)
-            if speak and not self._cancelled:
-                try:
-                    self.piper.speak(clean_reply)
-                except Exception as e:
-                    core.log(f"piper error: {e!r}")
+                core.log(f"brain stream error: {e!r}")
+
+            if not speak:
+                # Silent mode — just show the state for the visual + final text
+                self.state.emit("speaking", "// REPLY (silent)")
+                self.reply.emit(_strip_markdown(full_raw))
+
             self.finished_speaking.emit()
 
 
@@ -1081,6 +1125,8 @@ class JoeyApp(QObject):
         self._idle_timer = QTimer(self)
         self._idle_timer.setSingleShot(True)
         self._idle_timer.timeout.connect(self._idle_dismiss)
+        # 'voice' or 'text' — last trigger source; controls follow-up UX.
+        self._last_mode: str = "voice"
 
         # Voice worker — disabled by setting JOEY_VOICE=0
         if os.environ.get("JOEY_VOICE", "1") != "0":
@@ -1098,6 +1144,7 @@ class JoeyApp(QObject):
         core.log(f"trigger socket: {SOCK_PATH}")
 
     def on_trigger(self) -> None:
+        self._last_mode = "text"
         self.hud.set_transcript("")
         self.hud.set_reply("")
         self.hud.set_state("listening", "// AWAITING INPUT", show_input=True)
@@ -1106,6 +1153,7 @@ class JoeyApp(QObject):
     def on_voice_wake(self) -> None:
         # Wake word fired — open HUD in listening state, no text input
         # (mic is recording for the next ~few seconds via VoiceWorker.recorder).
+        self._last_mode = "voice"
         self.hud.set_transcript("")
         self.hud.set_reply("")
         self.hud.set_state("listening", "// LISTENING…", show_input=False)
@@ -1140,9 +1188,15 @@ class JoeyApp(QObject):
             self.hud.push_history(self._last_user, text)
 
     def _auto_hide(self) -> None:
-        # Conversation continues — drop back to listening so user can follow up.
-        self.hud.set_state("listening", "// CONTINUE OR ESC", show_input=True)
-        self._idle_timer.start(45_000)  # 45s idle window between turns
+        # Conversation continues. If the user came in by voice, keep wake-word
+        # follow-up as the primary path (no text input popup). If text mode,
+        # bring the input back for the next typed query.
+        if self._last_mode == "voice":
+            self.hud.set_state("listening", "// SAY \"HEY JARVIS\" TO CONTINUE",
+                               show_input=False)
+        else:
+            self.hud.set_state("listening", "// CONTINUE OR ESC", show_input=True)
+        self._idle_timer.start(45_000)
 
     def _idle_dismiss(self) -> None:
         if self.hud._state == "listening":
