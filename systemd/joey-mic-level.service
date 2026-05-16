@@ -7,7 +7,7 @@ Wants=pipewire-pulse.service
 Type=oneshot
 ExecStart=/bin/bash -c '\
   SRC=$$(pactl info | grep "Default Source" | awk "{print \\$3}");\
-  [ -n "$$SRC" ] && pactl set-source-volume "$$SRC" 40%;\
+  [ -n "$$SRC" ] && pactl set-source-volume "$$SRC" 30%;\
   pactl set-source-mute "$$SRC" 0;\
 '
 RemainAfterExit=yes
