@@ -28,7 +28,13 @@ SESSIONS_DIR.mkdir(exist_ok=True)
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 FRAME_LEN = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples
-WAKE_THRESHOLD = 0.5
+# Wake-word sensitivity. 0.5 is openWakeWord's default but is noisy — TV,
+# music, background voices trigger it. 0.65 is a much safer floor. Tune
+# with JOEY_WAKE_THRESHOLD env var without editing code.
+WAKE_THRESHOLD = float(os.environ.get("JOEY_WAKE_THRESHOLD", "0.65"))
+# Require N consecutive frames above threshold to fire — kills one-frame
+# spikes from transient noise (door close, cough, sudden music swell).
+WAKE_CONSECUTIVE_FRAMES = int(os.environ.get("JOEY_WAKE_FRAMES", "2"))
 SILENCE_TIMEOUT_S = 1.5     # stop recording after this much silence
 MAX_UTTERANCE_S = 20.0      # hard cap on one user utterance
 SESSION_IDLE_S = 120.0      # reset conversation after 2 min idle

@@ -950,6 +950,9 @@ class VoiceWorker(QThread):
 
     def _listen_for_wake(self) -> bool:
         chunk = 1280  # 80ms @ 16kHz — openWakeWord's preferred frame
+        # Require WAKE_CONSECUTIVE_FRAMES above threshold to suppress
+        # one-frame false positives from background noise.
+        streak = 0
         with sd.RawInputStream(
             samplerate=16000, blocksize=chunk, dtype="int16", channels=1
         ) as stream:
@@ -957,10 +960,21 @@ class VoiceWorker(QThread):
                 data, _ = stream.read(chunk)
                 pcm = np.frombuffer(bytes(data), dtype=np.int16)
                 preds = self._wake.model.predict(pcm)
-                for _name, score in preds.items():
-                    if score >= core.WAKE_THRESHOLD:
+                top_score = 0.0
+                top_name = ""
+                for name, score in preds.items():
+                    if score > top_score:
+                        top_score, top_name = score, name
+                if top_score >= core.WAKE_THRESHOLD:
+                    streak += 1
+                    if streak >= core.WAKE_CONSECUTIVE_FRAMES:
+                        core.log(f"voice: WAKE  {top_name}={top_score:.3f}  "
+                                 f"(threshold={core.WAKE_THRESHOLD}, "
+                                 f"streak={streak})")
                         self._wake.model.reset()
                         return True
+                else:
+                    streak = 0
         return False
 
 
