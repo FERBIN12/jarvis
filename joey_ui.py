@@ -1103,18 +1103,22 @@ class JoeyApp(QObject):
         self.hud.dismissed.connect(self._on_dismissed)
 
         # Brain backend:
-        #   default = HermesAPIBrain (direct Nous HTTPS, ~1-2s/turn)
-        #   JOEY_BRAIN=hermes-cli  → slow `hermes -z` subprocess (~5-10s/turn)
-        #   JOEY_BRAIN=claude      → claude -p
-        backend = os.environ.get("JOEY_BRAIN", "hermes-api").lower()
+        #   default = ClaudeCodeBrain (Haiku 4.5 + low-effort, streamed, ~2s/turn,
+        #             uses your Claude Code subscription)
+        #   JOEY_BRAIN=hermes-api  → direct Nous HTTPS (DeepSeek reasoning model, ~5s/turn)
+        #   JOEY_BRAIN=hermes-cli  → slow `hermes -z` subprocess (~10s/turn)
+        #   JOEY_BRAIN=claude-full → original ClaudeBrain (no streaming, sonnet)
+        backend = os.environ.get("JOEY_BRAIN", "claude-haiku").lower()
         core.log(f"loading TTS + brain (HUD mode, mic disabled, brain={backend})...")
         self.piper = core.Piper()
-        if backend == "claude":
+        if backend == "claude-full":
             self.brain = core.ClaudeBrain()
         elif backend == "hermes-cli":
             self.brain = core.HermesBrain()
-        else:
+        elif backend == "hermes-api":
             self.brain = core.HermesAPIBrain()
+        else:
+            self.brain = core.ClaudeCodeBrain()
         self.worker = BrainWorker(self.brain, self.piper)
         self.worker.state.connect(self._on_state)
         self.worker.transcript.connect(self._on_transcript)

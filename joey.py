@@ -367,6 +367,97 @@ class HermesAPIBrain:
         self.last_used = time.time()
 
 
+class ClaudeCodeBrain:
+    """Uses `claude -p` from the user's Claude Code installation. Streams
+    via `--output-format stream-json` so we get text-delta events as they
+    arrive. Multi-turn handled by capturing session_id and passing
+    `--resume <id>` on follow-up calls.
+
+    Latency on Haiku 4.5 with `--effort low` is ~1.5-2s per turn —
+    competitive with Groq, no extra auth, no extra cost since it runs
+    under your existing Claude Code subscription."""
+
+    DEFAULT_MODEL = "haiku"
+    DEFAULT_EFFORT = "low"   # skip extended thinking — fastest haiku path
+    IDLE_S = 180.0
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.last_used: float = 0.0
+
+    def _maybe_reset(self) -> None:
+        if self.session_id and (time.time() - self.last_used) > self.IDLE_S:
+            log("brain: idle reset, fresh session.")
+            self.session_id = None
+
+    def ask(self, user_text: str) -> str:
+        return "".join(self.ask_stream(user_text)) or "(empty reply)"
+
+    def ask_stream(self, user_text: str):
+        self._maybe_reset()
+        cmd = [
+            "claude", "-p",
+            "--model", self.DEFAULT_MODEL,
+            "--effort", self.DEFAULT_EFFORT,
+            "--output-format", "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+        ]
+        if self.session_id:
+            cmd += ["--resume", self.session_id]
+        cmd.append(user_text)
+        log(f"$ claude -p stream  model={self.DEFAULT_MODEL}  effort={self.DEFAULT_EFFORT}  "
+            f"{'resume' if self.session_id else 'new'}")
+
+        t0 = time.time()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        first_text_t: float | None = None
+        full_text_parts: list[str] = []
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = ev.get("session_id")
+                if sid:
+                    self.session_id = sid
+                if ev.get("type") == "stream_event":
+                    inner = ev.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            chunk = delta.get("text", "")
+                            if chunk:
+                                if first_text_t is None:
+                                    first_text_t = time.time()
+                                    log(f"brain: first text at {first_text_t - t0:.2f}s")
+                                full_text_parts.append(chunk)
+                                yield chunk
+                elif ev.get("type") == "result":
+                    # final summary — capture session_id (already done above)
+                    pass
+            proc.wait(timeout=30)
+        except Exception as e:
+            log(f"brain stream error: {e!r}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        log(f"brain: total {time.time() - t0:.2f}s  "
+            f"({sum(len(p) for p in full_text_parts)} chars)")
+        self.last_used = time.time()
+
+
 class HermesBrain:
     """Original `hermes -z` subprocess path — kept as fallback. Slower
     (~5-10s per turn) because hermes is a heavy Python CLI that cold-starts
