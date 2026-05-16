@@ -367,6 +367,68 @@ class HermesAPIBrain:
         self.last_used = time.time()
 
 
+class OpenClawBrain:
+    """Routes Jarvis through the user's OpenClaw gateway — same brain as
+    other channels they wire to it (Discord, WhatsApp, etc), and benefits
+    from OpenClaw's multi-model routing / agent ecosystem.
+
+    OpenClaw's `infer model run --gateway` path is stateless one-shot, so
+    multi-turn memory is handled here by inlining recent history into the
+    prompt. Default model is Haiku 4.5 (override with JOEY_OPENCLAW_MODEL).
+    """
+
+    DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
+    IDLE_S = 180.0
+    HISTORY_MAX_PAIRS = 6
+
+    def __init__(self) -> None:
+        self.history: list[tuple[str, str]] = []  # (user, reply) pairs
+        self.last_used = 0.0
+
+    def _build_prompt(self, user_text: str) -> str:
+        if not self.history:
+            return user_text
+        recent = self.history[-self.HISTORY_MAX_PAIRS:]
+        block = "\n\n".join(f"User: {u}\nAssistant: {r}" for u, r in recent)
+        return f"Conversation so far:\n{block}\n\nUser: {user_text}\nAssistant:"
+
+    def ask(self, user_text: str) -> str:
+        if self.history and (time.time() - self.last_used) > self.IDLE_S:
+            log("brain: idle reset.")
+            self.history = []
+        model = os.environ.get("JOEY_OPENCLAW_MODEL", self.DEFAULT_MODEL)
+        cmd = [
+            "openclaw", "infer", "model", "run",
+            "--gateway",
+            "--model", model,
+            "--prompt", self._build_prompt(user_text),
+            "--json",
+        ]
+        log(f"$ openclaw infer model run  model={model}")
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return "OpenClaw timed out."
+        if proc.returncode != 0:
+            return f"OpenClaw error: {proc.stderr.strip()[:300]}"
+        # openclaw prints config warnings to stdout before the JSON object;
+        # strip everything before the first '{' on its own line.
+        out = proc.stdout
+        brace = out.find("\n{")
+        if brace != -1:
+            out = out[brace + 1:]
+        try:
+            data = json.loads(out)
+            text = data.get("outputs", [{}])[0].get("text", "") or ""
+        except Exception as e:
+            return f"OpenClaw parse error: {e}; raw={out[:200]}"
+        log(f"brain: {time.time() - t0:.2f}s  ({len(text)} chars)")
+        self.history.append((user_text, text))
+        self.last_used = time.time()
+        return text or "(empty reply)"
+
+
 class ClaudeCodeBrain:
     """Uses `claude -p` from the user's Claude Code installation. Streams
     via `--output-format stream-json` so we get text-delta events as they

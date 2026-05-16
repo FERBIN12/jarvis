@@ -1103,22 +1103,24 @@ class JoeyApp(QObject):
         self.hud.dismissed.connect(self._on_dismissed)
 
         # Brain backend:
-        #   default = ClaudeCodeBrain (Haiku 4.5 + low-effort, streamed, ~2s/turn,
-        #             uses your Claude Code subscription)
-        #   JOEY_BRAIN=hermes-api  → direct Nous HTTPS (DeepSeek reasoning model, ~5s/turn)
-        #   JOEY_BRAIN=hermes-cli  → slow `hermes -z` subprocess (~10s/turn)
-        #   JOEY_BRAIN=claude-full → original ClaudeBrain (no streaming, sonnet)
-        backend = os.environ.get("JOEY_BRAIN", "claude-haiku").lower()
+        #   default = OpenClawBrain    (routes through user's OpenClaw gateway → Haiku 4.5, ~3s/turn)
+        #   claude-haiku → ClaudeCodeBrain (claude -p haiku, streamed, ~2s/turn)
+        #   claude-full  → ClaudeBrain      (original, sonnet, full agent context)
+        #   hermes-api   → HermesAPIBrain   (Nous DeepSeek, reasoning, ~5s/turn)
+        #   hermes-cli   → HermesBrain      (slow `hermes -z` subprocess)
+        backend = os.environ.get("JOEY_BRAIN", "openclaw").lower()
         core.log(f"loading TTS + brain (HUD mode, mic disabled, brain={backend})...")
         self.piper = core.Piper()
-        if backend == "claude-full":
+        if backend == "claude-haiku":
+            self.brain = core.ClaudeCodeBrain()
+        elif backend == "claude-full":
             self.brain = core.ClaudeBrain()
         elif backend == "hermes-cli":
             self.brain = core.HermesBrain()
         elif backend == "hermes-api":
             self.brain = core.HermesAPIBrain()
         else:
-            self.brain = core.ClaudeCodeBrain()
+            self.brain = core.OpenClawBrain()
         self.worker = BrainWorker(self.brain, self.piper)
         self.worker.state.connect(self._on_state)
         self.worker.transcript.connect(self._on_transcript)
