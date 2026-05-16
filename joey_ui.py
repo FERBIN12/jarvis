@@ -183,6 +183,26 @@ class JarvisHUD(QWidget):
         self._bars = [0.05] * 96
         self._target_bars = [0.05] * 96
         self._tick_n = 0
+        # --- Stark-mode extras ---
+        # Floating particle field (initialized lazily after geometry known)
+        self._particles: list[list[float]] = []   # [x, y, vx, vy, phase]
+        self._n_particles = 70
+        # Side EQ bars (left + right vertical spectrums)
+        self._side_bars_l = [0.05] * 28
+        self._side_bars_r = [0.05] * 28
+        self._target_side_l = [0.05] * 28
+        self._target_side_r = [0.05] * 28
+        # Energy-line dash offset for orb → corner-panel beams
+        self._beam_phase = 0.0
+        # Scrolling pseudo-tech-text streams in panels
+        self._stream_lines_left: list[str] = []
+        self._stream_lines_right: list[str] = []
+        self._stream_seed = random.Random(42)
+        # Holographic flicker
+        self._flicker = 1.0
+        self._flicker_target = 1.0
+        # Outer rim slider position
+        self._rim_phase = 0.0
 
         self._anim = QTimer(self)
         self._anim.setInterval(33)
@@ -388,6 +408,8 @@ class JarvisHUD(QWidget):
         self._hline_phase += 0.013
         if self._hline_phase > 1.2:
             self._hline_phase = -0.2
+        self._beam_phase += 0.6 * speed
+        self._rim_phase += 0.006 * speed
 
         amp = {"listening": 0.85, "thinking": 0.55, "speaking": 1.0}.get(self._state, 0.15)
         for i in range(len(self._bars)):
@@ -395,7 +417,73 @@ class JarvisHUD(QWidget):
             self._target_bars[i] = base * amp * (0.6 + 0.4 * random.random())
             self._bars[i] = self._bars[i] * 0.72 + self._target_bars[i] * 0.28
 
+        # Side spectrum bars: independent random walk, smoother (slower decay)
+        amp_side = amp * 0.85
+        for i in range(len(self._side_bars_l)):
+            self._target_side_l[i] = (
+                (math.sin(self._tick_n * 0.11 + i * 0.5) + 1) * 0.5
+                * amp_side * (0.55 + 0.45 * random.random())
+            )
+            self._target_side_r[i] = (
+                (math.sin(self._tick_n * 0.13 + i * 0.47 + 1.7) + 1) * 0.5
+                * amp_side * (0.55 + 0.45 * random.random())
+            )
+            self._side_bars_l[i] = self._side_bars_l[i] * 0.78 + self._target_side_l[i] * 0.22
+            self._side_bars_r[i] = self._side_bars_r[i] * 0.78 + self._target_side_r[i] * 0.22
+
+        # Particle field — wrap on edges
+        if not self._particles:
+            self._init_particles()
+        W, H = self.width(), self.height()
+        for p in self._particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[4] += 0.04
+            if p[0] < 0: p[0] += W
+            elif p[0] > W: p[0] -= W
+            if p[1] < 0: p[1] += H
+            elif p[1] > H: p[1] -= H
+
+        # Scrolling tech-text — occasionally append a new line to each panel stream
+        if self._tick_n % 4 == 0:
+            self._stream_lines_left.append(self._gen_tech_line())
+            self._stream_lines_right.append(self._gen_tech_line())
+            del self._stream_lines_left[:-12]
+            del self._stream_lines_right[:-12]
+
+        # Holographic flicker — drift toward target, occasionally jump
+        if self._tick_n % 12 == 0:
+            self._flicker_target = 0.92 + 0.08 * random.random()
+        self._flicker = self._flicker * 0.9 + self._flicker_target * 0.1
+
         self.update()
+
+    def _init_particles(self) -> None:
+        W, H = self.width(), self.height()
+        self._particles = []
+        for _ in range(self._n_particles):
+            self._particles.append([
+                random.uniform(0, W),
+                random.uniform(0, H),
+                random.uniform(-0.45, 0.45),
+                random.uniform(-0.35, 0.35),
+                random.uniform(0, 6.28),
+            ])
+
+    def _gen_tech_line(self) -> str:
+        r = self._stream_seed
+        kind = r.randint(0, 5)
+        if kind == 0:
+            return f"0x{r.randint(0, 0xFFFFFFFF):08X}  OK"
+        if kind == 1:
+            return f"LAT {r.randint(0, 9999):04d}  LON {r.randint(0, 9999):04d}"
+        if kind == 2:
+            return f"PKT {r.randint(0, 999):03d}/{r.randint(1, 999):03d}  RX"
+        if kind == 3:
+            return f"ANGL {r.uniform(-180,180):+7.2f}°  RAD {r.uniform(0,1):.3f}"
+        if kind == 4:
+            return f"NET  {r.randint(1, 254):3d}.{r.randint(0,254):3d}.{r.randint(0,254):3d}.{r.randint(1,254):3d}"
+        return f"PROC PID {r.randint(1000, 99999)}  Q={r.randint(0,9)}"
 
     def push_history(self, user: str, reply: str) -> None:
         self._history.insert(0, (user, reply))
@@ -416,21 +504,33 @@ class JarvisHUD(QWidget):
         # 1) DARK BACKDROP (full screen dimmer)
         p.fillRect(self.rect(), QColor(2, 6, 14, 220))
 
-        # 2) BG: hex grid + global scan line
+        # 2) BG layers: hex grid + horizontal scan + particles + CRT scanlines
         self._draw_hex_grid(p, accent)
+        self._draw_particles(p, accent)
+        self._draw_crt_scanlines(p, accent)
         self._draw_horizontal_scan(p, accent)
 
-        # 3) HUD frame brackets
+        # 3) HUD frame brackets + outer rim sliding indicators
         self._draw_screen_brackets(p, primary, W, H)
+        self._draw_rim_indicators(p, primary, accent, W, H)
 
-        # 4) Corner panels (telemetry, subsystems, history, globe)
+        # 4) Side spectrum bars (left + right vertical EQ)
+        self._draw_side_spectrums(p, accent, W, H)
+
+        # 5) Center: orb position
+        cx, cy = W / 2, H / 2 - 30
+
+        # 6) Energy beams (drawn BEFORE panels so beams appear to emerge
+        #    from the orb and connect to corner panels)
+        self._draw_energy_beams(p, cx, cy, accent, W, H)
+
+        # 7) Corner panels (telemetry, subsystems, history, globe)
         self._draw_panel_telemetry(p, primary, accent, text_color)
         self._draw_panel_subsystems(p, primary, accent, text_color)
         self._draw_panel_history(p, primary, accent, text_color)
         self._draw_panel_globe(p, primary, accent)
 
-        # 5) Center: orb stack
-        cx, cy = W / 2, H / 2 - 30
+        # 8) Orb stack (drawn on top of beams so endpoints look attached)
         self._draw_outer_arc_ring(p, cx, cy, primary, accent, radius=320)
         self._draw_tick_marks(p, cx, cy, primary, r_in=290, r_out=302, count=72)
         self._draw_audio_bars(p, cx, cy, accent, r_base=200, max_len=72)
@@ -439,11 +539,127 @@ class JarvisHUD(QWidget):
         self._draw_sphere(p, cx, cy, primary, accent, base_r=92)
         self._draw_scan(p, cx, cy, accent, radius=300)
 
-        # 6) Header + footer text
+        # 9) Header + footer text + response panel
         self._draw_header_bar(p, primary, accent, text_color, W)
         self._draw_status_big(p, cx, cy, text_color)
         self._draw_transcript_reply(p, text_color, W, H)
         p.end()
+
+    # --- floating particle field (drifting glow dots) ---
+    def _draw_particles(self, p: QPainter, accent: QColor) -> None:
+        if not self._particles:
+            return
+        p.setPen(Qt.NoPen)
+        for px, py, _vx, _vy, ph in self._particles:
+            br = 0.5 + 0.5 * math.sin(ph)
+            alpha = int(40 + 120 * br * self._flicker)
+            r = 1.2 + 1.6 * br
+            # subtle glow halo
+            glow = QRadialGradient(QPointF(px, py), r * 3)
+            glow.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
+            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setBrush(glow)
+            p.drawEllipse(QPointF(px, py), r * 3, r * 3)
+            # core dot
+            p.setBrush(QColor(255, 255, 255, min(255, alpha + 60)))
+            p.drawEllipse(QPointF(px, py), r, r)
+
+    # --- subtle CRT-style scanlines overlay ---
+    def _draw_crt_scanlines(self, p: QPainter, accent: QColor) -> None:
+        col = QColor(accent.red(), accent.green(), accent.blue(), 10)
+        p.setPen(QPen(col, 1))
+        H = self.height()
+        for y in range(0, H, 3):
+            p.drawLine(0, y, self.width(), y)
+
+    # --- 4 sliding "indicator dots" running around the outer screen edge ---
+    def _draw_rim_indicators(self, p: QPainter, primary: QColor, accent: QColor,
+                              W: int, H: int) -> None:
+        # 8 dots, evenly spaced, all sliding clockwise around the rectangle's edge
+        perim = 2 * (W + H)
+        count = 8
+        p.setPen(Qt.NoPen)
+        for i in range(count):
+            t = ((i / count) + (self._rim_phase % 1.0)) % 1.0
+            d = t * perim
+            # walk the rectangle perimeter (TL → TR → BR → BL → TL)
+            if d < W:
+                x, y = d, 0.0
+            elif d < W + H:
+                x, y = float(W), d - W
+            elif d < 2 * W + H:
+                x, y = float(W) - (d - W - H), float(H)
+            else:
+                x, y = 0.0, float(H) - (d - 2 * W - H)
+            r_glow = 7
+            glow = QRadialGradient(QPointF(x, y), r_glow * 2.5)
+            glow.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 200))
+            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setBrush(glow)
+            p.drawEllipse(QPointF(x, y), r_glow * 2.5, r_glow * 2.5)
+            p.setBrush(QColor(255, 255, 255, 220))
+            p.drawEllipse(QPointF(x, y), 2.5, 2.5)
+
+    # --- vertical spectrum EQ bars on left + right margins ---
+    def _draw_side_spectrums(self, p: QPainter, accent: QColor, W: int, H: int) -> None:
+        bar_w = 4
+        gap = 14
+        total = len(self._side_bars_l) * (bar_w + gap) - gap
+        y0 = (H - total) // 2
+        max_h = 130
+        for i, h in enumerate(self._side_bars_l):
+            bh = int(max_h * h)
+            yy = y0 + i * (bar_w + gap) + (bar_w - bar_w) // 2
+            grad = QRadialGradient(QPointF(40, yy + bar_w / 2), bh + 8)
+            alpha = int(120 + 130 * h)
+            grad.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
+            grad.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 30))
+            p.setBrush(grad)
+            p.setPen(Qt.NoPen)
+            p.drawRect(QRectF(28, yy, bh, bar_w))
+        for i, h in enumerate(self._side_bars_r):
+            bh = int(max_h * h)
+            yy = y0 + i * (bar_w + gap)
+            grad = QRadialGradient(QPointF(W - 40, yy + bar_w / 2), bh + 8)
+            alpha = int(120 + 130 * h)
+            grad.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
+            grad.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 30))
+            p.setBrush(grad)
+            p.setPen(Qt.NoPen)
+            p.drawRect(QRectF(W - 28 - bh, yy, bh, bar_w))
+
+    # --- 4 animated dashed beams from orb center to each corner-panel center ---
+    def _draw_energy_beams(self, p: QPainter, cx: float, cy: float,
+                            accent: QColor, W: int, H: int) -> None:
+        # Skip rendering through the sphere itself — start at sphere edge
+        sphere_r = 100
+        endpoints = [
+            (200, 190),                 # top-left panel center
+            (W - 200, 190),              # top-right
+            (200, H - 200),              # bottom-left
+            (W - 200, H - 200),          # bottom-right
+        ]
+        for ex, ey in endpoints:
+            dx, dy = ex - cx, ey - cy
+            dist = math.hypot(dx, dy) or 1
+            ux, uy = dx / dist, dy / dist
+            sx, sy = cx + ux * sphere_r, cy + uy * sphere_r
+            # Animated dashed line — flowing outward
+            pen = QPen(QColor(accent.red(), accent.green(), accent.blue(), 160), 1.4)
+            pen.setStyle(Qt.DashLine)
+            pen.setDashPattern([4, 8])
+            pen.setDashOffset(-self._beam_phase * 1.5)  # negative = flow outward
+            p.setPen(pen)
+            p.drawLine(QPointF(sx, sy), QPointF(ex, ey))
+            # Pulse blob at the panel endpoint
+            pulse = 0.6 + 0.4 * math.sin(self._beam_phase * 0.4)
+            r_pulse = 5 * pulse
+            glow = QRadialGradient(QPointF(ex, ey), r_pulse * 3)
+            glow.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), 200))
+            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+            p.setBrush(glow)
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(QPointF(ex, ey), r_pulse * 3, r_pulse * 3)
 
     # --- subtle hex grid covering full screen ---
     def _draw_hex_grid(self, p: QPainter, accent: QColor) -> None:
@@ -502,6 +718,8 @@ class JarvisHUD(QWidget):
     def _draw_panel_telemetry(self, p: QPainter, primary, accent, text) -> None:
         x, y, w, h = 60, 100, 280, 180
         self._panel_frame(p, x, y, w, h, primary, "TELEMETRY")
+        # Background scrolling tech-text (very faint)
+        self._draw_panel_stream(p, x, y, w, h, self._stream_lines_left, accent)
         f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(9)
         p.setFont(f)
         p.setPen(text)
@@ -530,6 +748,7 @@ class JarvisHUD(QWidget):
         w, h = 280, 180
         x, y = W - w - 60, 100
         self._panel_frame(p, x, y, w, h, primary, "SUBSYSTEMS")
+        self._draw_panel_stream(p, x, y, w, h, self._stream_lines_right, accent)
         f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(9)
         p.setFont(f)
         rows = [
@@ -598,6 +817,25 @@ class JarvisHUD(QWidget):
         p.setBrush(col)
         p.setPen(Qt.NoPen)
         p.drawEllipse(QPointF(gx, gy), 2.5, 2.5)
+
+    # --- Faint scrolling tech-text inside a panel (background flavor) ---
+    def _draw_panel_stream(self, p: QPainter, x: int, y: int, w: int, h: int,
+                            lines: list[str], accent: QColor) -> None:
+        if not lines:
+            return
+        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(7)
+        p.setFont(f)
+        col = QColor(accent.red(), accent.green(), accent.blue(), 38)
+        p.setPen(col)
+        # right-justified column on the panel's right edge
+        right = x + w - 14
+        bottom = y + h - 10
+        for i, line in enumerate(reversed(lines)):
+            yy = bottom - i * 11
+            if yy < y + 36:
+                break
+            fm = p.fontMetrics()
+            p.drawText(right - fm.horizontalAdvance(line), yy, line)
 
     # --- Panel frame helper: thin rect + title bar ---
     def _panel_frame(self, p: QPainter, x: float, y: float, w: float, h: float,
@@ -691,15 +929,17 @@ class JarvisHUD(QWidget):
             p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 230), 2))
             p.drawArc(rect, int(start), int(span))
 
-    # --- central sphere (scaled up) ---
+    # --- central sphere with inner pulsing core + reactor lines ---
     def _draw_sphere(self, p, cx, cy, primary, accent, base_r=92) -> None:
         pulse = 1.0 + 0.10 * math.sin(self._sphere_phase)
         r = base_r * pulse
-        # outer halo (bloom)
-        for i, alpha in enumerate((26, 18, 12, 7)):
+        flick = self._flicker
+        # outer halo (4-layer bloom)
+        for i, alpha in enumerate((30, 22, 14, 8)):
             rr = r + 10 + i * 14
             halo = QRadialGradient(QPointF(cx, cy), rr)
-            halo.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), alpha))
+            a = int(alpha * flick)
+            halo.setColorAt(0.0, QColor(accent.red(), accent.green(), accent.blue(), a))
             halo.setColorAt(1.0, QColor(0, 0, 0, 0))
             p.setBrush(halo); p.setPen(Qt.NoPen)
             p.drawEllipse(QPointF(cx, cy), rr, rr)
@@ -711,9 +951,29 @@ class JarvisHUD(QWidget):
         p.setBrush(body)
         p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 220), 1.5))
         p.drawEllipse(QPointF(cx, cy), r, r)
-        # highlight
+        # reactor-style spokes (8 radial lines inside the sphere)
+        spoke_phase = self._sphere_phase * 0.7
+        for k in range(8):
+            ang = k * math.pi / 4 + spoke_phase
+            inner_r = r * 0.25
+            outer_r = r * 0.85
+            x1 = cx + math.cos(ang) * inner_r
+            y1 = cy + math.sin(ang) * inner_r
+            x2 = cx + math.cos(ang) * outer_r
+            y2 = cy + math.sin(ang) * outer_r
+            p.setPen(QPen(QColor(255, 255, 255, 90), 1))
+            p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+        # inner pulsing core
+        core_r = r * (0.22 + 0.06 * math.sin(self._sphere_phase * 2))
+        core = QRadialGradient(QPointF(cx, cy), core_r * 1.4)
+        core.setColorAt(0.0, QColor(255, 255, 255, 240))
+        core.setColorAt(0.6, QColor(accent.red(), accent.green(), accent.blue(), 200))
+        core.setColorAt(1.0, QColor(accent.red(), accent.green(), accent.blue(), 0))
+        p.setBrush(core); p.setPen(Qt.NoPen)
+        p.drawEllipse(QPointF(cx, cy), core_r * 1.4, core_r * 1.4)
+        # specular highlight
         hl = QRadialGradient(QPointF(cx - r * 0.4, cy - r * 0.4), r * 0.7)
-        hl.setColorAt(0.0, QColor(255, 255, 255, 130))
+        hl.setColorAt(0.0, QColor(255, 255, 255, 140))
         hl.setColorAt(1.0, QColor(255, 255, 255, 0))
         p.setBrush(hl); p.setPen(Qt.NoPen)
         p.drawEllipse(QPointF(cx - r * 0.25, cy - r * 0.25), r * 0.75, r * 0.75)
