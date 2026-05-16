@@ -384,6 +384,32 @@ class OpenClawBrain:
     def __init__(self) -> None:
         self.history: list[tuple[str, str]] = []  # (user, reply) pairs
         self.last_used = 0.0
+        self.bin = self._resolve_binary()
+        log(f"OpenClawBrain: using {self.bin}")
+
+    @staticmethod
+    def _resolve_binary() -> str:
+        """Find openclaw regardless of systemd PATH stripping. Searches
+        PATH first, then common nvm/npm-global locations."""
+        import shutil
+        from pathlib import Path
+        found = shutil.which("openclaw")
+        if found:
+            return found
+        candidates = [
+            Path.home() / ".local" / "bin" / "openclaw",
+        ]
+        nvm = Path.home() / ".nvm" / "versions" / "node"
+        if nvm.exists():
+            for ver_dir in sorted(nvm.iterdir(), reverse=True):
+                cand = ver_dir / "bin" / "openclaw"
+                if cand.exists():
+                    candidates.append(cand)
+        for c in candidates:
+            if c.exists():
+                return str(c)
+        # Fall back — subprocess will surface a clear error
+        return "openclaw"
 
     def _build_prompt(self, user_text: str) -> str:
         if not self.history:
@@ -398,7 +424,7 @@ class OpenClawBrain:
             self.history = []
         model = os.environ.get("JOEY_OPENCLAW_MODEL", self.DEFAULT_MODEL)
         cmd = [
-            "openclaw", "infer", "model", "run",
+            self.bin, "infer", "model", "run",
             "--gateway",
             "--model", model,
             "--prompt", self._build_prompt(user_text),
