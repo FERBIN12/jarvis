@@ -30,3 +30,17 @@ sessions/
 ## Build artifacts
 build/
 dist/
+
+## Secrets / credentials — never commit these (belt-and-braces)
+.env
+.env.*
+*.env
+secrets.json
+credentials.json
+**/credentials.json
+*.pem
+*.key
+*.p12
+*_token
+*_secret
+auth.json
