@@ -1,0 +1,23 @@
+[project]
+name = "joey"
+version = "0.1.0"
+description = "Voice agent that talks to Claude Code via wake word"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "openwakeword>=0.6.0",
+    "faster-whisper>=1.0.3",
+    "piper-tts>=1.2.0",
+    "sounddevice>=0.4.7",
+    "soundfile>=0.12.1",
+    "numpy>=1.26,<2.0",
+    "webrtcvad-wheels>=2.0.14",
+    "PySide6>=6.7",
+    "python-xlib>=0.33",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["joey"]

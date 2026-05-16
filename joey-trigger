@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Tiny script to wake the running Joey UI via its Unix socket.
+Bind a GNOME custom shortcut (e.g. Ctrl+Space) to: /home/ferbin/joey/joey-trigger
+"""
+import socket
+import sys
+from pathlib import Path
+
+SOCK = Path.home() / ".joey" / "trigger.sock"
+
+if not SOCK.exists():
+    print(f"joey UI not running (no socket at {SOCK})", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(str(SOCK))
+    s.close()
+except OSError as e:
+    print(f"trigger failed: {e}", file=sys.stderr)
+    sys.exit(2)
