@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 import socket
 import sys
 import threading
@@ -52,6 +53,76 @@ SOCK_PATH = Path.home() / ".joey" / "trigger.sock"
 SOCK_PATH.parent.mkdir(exist_ok=True)
 
 
+# ---------- helpers ----------
+_MD_FENCE   = re.compile(r"```[\s\S]*?```")
+_MD_BTICK   = re.compile(r"`([^`]+)`")
+_MD_BOLD_S  = re.compile(r"\*\*([^*]+)\*\*")
+_MD_ITAL_S  = re.compile(r"(?<!\*)\*([^*\n]+)\*(?!\*)")
+_MD_BOLD_U  = re.compile(r"__([^_]+)__")
+_MD_ITAL_U  = re.compile(r"(?<!_)_([^_\n]+)_(?!_)")
+_MD_HDR     = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_MD_LINK    = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_HRULE   = re.compile(r"^[-*_]{3,}\s*$", re.MULTILINE)
+_MD_QUOTE   = re.compile(r"^>\s?", re.MULTILINE)
+_MD_LIST    = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
+_MD_BLANK3  = re.compile(r"\n{3,}")
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove common markdown formatting so the HUD doesn't render literal
+    `**` / `#` characters and Piper TTS doesn't pronounce them."""
+    if not text:
+        return text
+    text = _MD_FENCE.sub("", text)
+    text = _MD_BTICK.sub(r"\1", text)
+    text = _MD_BOLD_S.sub(r"\1", text)
+    text = _MD_BOLD_U.sub(r"\1", text)
+    text = _MD_ITAL_S.sub(r"\1", text)
+    text = _MD_ITAL_U.sub(r"\1", text)
+    text = _MD_HDR.sub("", text)
+    text = _MD_LINK.sub(r"\1", text)
+    text = _MD_HRULE.sub("", text)
+    text = _MD_QUOTE.sub("", text)
+    text = _MD_LIST.sub("• ", text)
+    text = _MD_BLANK3.sub("\n\n", text)
+    return text.strip()
+
+
+def _wrap_text(text: str, fm, max_width: int) -> list[str]:
+    """Greedy word-wrap. Falls back to hard char-split for tokens longer
+    than max_width (e.g. URLs, code identifiers)."""
+    lines: list[str] = []
+    for raw_line in text.splitlines() or [""]:
+        if not raw_line:
+            lines.append("")
+            continue
+        words = raw_line.split(" ")
+        cur = ""
+        for w in words:
+            candidate = f"{cur} {w}" if cur else w
+            if fm.horizontalAdvance(candidate) <= max_width:
+                cur = candidate
+            else:
+                if cur:
+                    lines.append(cur)
+                # Hard-split anything still too wide on its own
+                while fm.horizontalAdvance(w) > max_width and len(w) > 1:
+                    # find split point that fits
+                    lo, hi = 1, len(w)
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if fm.horizontalAdvance(w[:mid]) <= max_width:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    lines.append(w[:lo])
+                    w = w[lo:]
+                cur = w
+        if cur:
+            lines.append(cur)
+    return lines
+
+
 # ---------- palette ----------
 # (primary, accent, text)
 PALETTES = {
@@ -78,6 +149,7 @@ class JarvisHUD(QWidget):
     """
 
     user_text_submitted = Signal(str)
+    dismissed = Signal()  # emitted on ESC / set_state("hidden") — cancels TTS
 
     def __init__(self) -> None:
         super().__init__()
@@ -149,10 +221,10 @@ class JarvisHUD(QWidget):
         self._opacity_anim = QPropertyAnimation(self, b"windowOpacity")
         self._opacity_anim.setDuration(280)
         self.setWindowOpacity(0.0)
-        # Keep the window always mapped (X11 focus is more predictable that way).
-        # Start invisible to clicks + at zero opacity.
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.show()
+        # NB: window starts UNMAPPED. A fullscreen always-on-top transparent
+        # window will swallow clicks even with WA_TransparentForMouseEvents
+        # on some X11 compositors — so we genuinely hide it when idle.
+        # X11 focus on re-show is handled via grabKeyboard() + _xlib_force_activate.
 
     # ---- public state api ----
     def set_state(self, state: str, status: str = "", show_input: bool = False) -> None:
@@ -165,6 +237,7 @@ class JarvisHUD(QWidget):
             self._fade_out()
             self._anim.stop()
             self.input.hide()
+            self.dismissed.emit()
             return
         if prev == "hidden":
             self._reply_text = ""
@@ -266,10 +339,9 @@ class JarvisHUD(QWidget):
         return super().eventFilter(obj, event)
 
     def _fade_in(self) -> None:
-        # Make window click/keystroke-receivable again, but DON'T re-show()
-        # (window is always mapped — see __init__). That way X11 focus path
-        # stays clean across multiple ESC/Ctrl+Space cycles.
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # Map + raise + activate. grabKeyboard() in _reclaim_focus handles the
+        # X11 focus race so input still receives keys on subsequent re-shows.
+        self.show()
         self.raise_()
         self.activateWindow()
         self._opacity_anim.stop()
@@ -293,12 +365,13 @@ class JarvisHUD(QWidget):
         self._opacity_anim.start()
 
     def _on_fade_out_done(self) -> None:
-        # Window stays mapped but becomes invisible to clicks so it doesn't
-        # block content behind it. Input also hides so it can't catch input.
+        # Genuinely hide the window — never block clicks/scrolls on the
+        # rest of the desktop. grabKeyboard is released here so other
+        # apps can receive keyboard input again.
         self.input.releaseKeyboard()
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.input.hide()
         self.input.clear()
+        self.hide()
 
     def _tick(self) -> None:
         self._tick_n += 1
@@ -693,23 +766,75 @@ class JarvisHUD(QWidget):
         w = fm.horizontalAdvance(s)
         p.drawText(int(cx - w / 2), int(cy + 380), s)
 
-    # --- Transcript + reply above the input ---
+    # --- Transcript + reply: dedicated big panel overlaying the bottom area ---
     def _draw_transcript_reply(self, p, color, W, H) -> None:
-        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(11)
+        if not (self._transcript or self._reply_text):
+            return
+        # Don't render the response panel while the user is mid-typing
+        if self.input.isVisible() and not self._reply_text:
+            return
+
+        # Panel geometry — large, central, above the input. Overlays the
+        # bottom side panels (history, globe) when there's content to show.
+        margin_x = 100
+        box_x = margin_x
+        box_w = W - 2 * margin_x
+        box_y_top = H - 460
+        box_y_bot = H - 130
+        box_h = box_y_bot - box_y_top
+
+        # Translucent dark backdrop so text is readable over whatever is behind
+        rect = QRectF(box_x, box_y_top, box_w, box_h)
+        p.fillRect(rect, QColor(2, 10, 20, 235))
+        p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 160), 1))
+        p.drawRect(rect)
+        # title strip
+        title_h = 28
+        p.fillRect(QRectF(box_x, box_y_top, box_w, title_h),
+                   QColor(color.red(), color.green(), color.blue(), 50))
+        p.setPen(QPen(color, 1))
+        p.drawLine(int(box_x), int(box_y_top + title_h),
+                   int(box_x + box_w), int(box_y_top + title_h))
+        # title text
+        ft = QFont("Monospace"); ft.setStyleHint(QFont.TypeWriter); ft.setPointSize(9)
+        ft.setBold(True); p.setFont(ft)
+        p.setPen(QColor(220, 240, 255))
+        p.drawText(int(box_x + 14), int(box_y_top + 19), "RESPONSE //")
+
+        # Body font — bigger and roomier for readability
+        f = QFont("Monospace"); f.setStyleHint(QFont.TypeWriter); f.setPointSize(12)
         p.setFont(f)
-        y0 = H - 170
+        fm = p.fontMetrics()
+        line_h = fm.height() + 2
+
+        inner_x = box_x + 18
+        inner_w = box_w - 36
+        y = box_y_top + title_h + 8 + fm.ascent()
+
+        # Transcript first (in dimmer tone)
         if self._transcript:
             p.setPen(QColor(color.red(), color.green(), color.blue(), 200))
-            line = f"> {self._transcript[:90]}"
-            fm = p.fontMetrics()
-            p.drawText(int((W - fm.horizontalAdvance(line)) / 2), y0, line)
+            t_lines = _wrap_text(f"> {self._transcript}", fm, inner_w)
+            for tl in t_lines[:2]:
+                p.drawText(inner_x, y, tl)
+                y += line_h
+            y += 6
+
+        # Reply body
         if self._reply_text:
             p.setPen(color)
-            line = self._reply_text[:110]
-            if len(self._reply_text) > 110:
-                line += "…"
-            fm = p.fontMetrics()
-            p.drawText(int((W - fm.horizontalAdvance(line)) / 2), y0 + 26, line)
+            lines = _wrap_text(self._reply_text, fm, inner_w)
+            avail_h = (box_y_bot - 14) - y
+            max_lines = max(1, avail_h // line_h)
+            truncated = len(lines) > max_lines
+            if truncated:
+                lines = lines[:max_lines]
+            for line in lines:
+                p.drawText(inner_x, y, line)
+                y += line_h
+            if truncated:
+                p.setPen(QColor(color.red(), color.green(), color.blue(), 160))
+                p.drawText(inner_x, y, "  … (truncated — full text logged to console)")
 
 
 # ---------- trigger socket ----------
@@ -852,6 +977,7 @@ class BrainWorker(QThread):
         self.piper = piper
         self._prompt: str | None = None
         self._speak: bool = True
+        self._cancelled: bool = False
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stop = False
@@ -860,7 +986,18 @@ class BrainWorker(QThread):
         with self._lock:
             self._prompt = prompt
             self._speak = speak
+            self._cancelled = False
         self._wake.set()
+
+    def cancel(self) -> None:
+        """Interrupt mid-cycle: stops TTS playback immediately. Synthesis
+        already underway can't be aborted cleanly without killing the thread,
+        but cutting the audio is what the user actually feels."""
+        self._cancelled = True
+        try:
+            sd.stop()
+        except Exception:
+            pass
 
     def stop(self) -> None:
         self._stop = True
@@ -879,15 +1016,19 @@ class BrainWorker(QThread):
             self.transcript.emit(prompt)
             self.state.emit("thinking", "// PROCESSING")
             try:
-                reply = self.brain.ask(prompt)
+                raw_reply = self.brain.ask(prompt)
             except Exception as e:
-                reply = f"(error: {e})"
+                raw_reply = f"(error: {e})"
+            clean_reply = _strip_markdown(raw_reply)
+            if self._cancelled:
+                self.finished_speaking.emit()
+                continue
             status = "// RESPONDING" if speak else "// REPLY (silent)"
             self.state.emit("speaking", status)
-            self.reply.emit(reply)
-            if speak:
+            self.reply.emit(clean_reply)
+            if speak and not self._cancelled:
                 try:
-                    self.piper.speak(reply)
+                    self.piper.speak(clean_reply)
                 except Exception as e:
                     core.log(f"piper error: {e!r}")
             self.finished_speaking.emit()
@@ -901,6 +1042,7 @@ class JoeyApp(QObject):
         self.trigger = TriggerSocket(SOCK_PATH)
         self.trigger.triggered.connect(self.on_trigger)
         self.hud.user_text_submitted.connect(self.on_submit_text)
+        self.hud.dismissed.connect(self._on_dismissed)
 
         # Brain backend: Hermes Agent by default (procedural memory, skill
         # accumulation, MCP-native). Set JOEY_BRAIN=claude to fall back.
@@ -987,6 +1129,12 @@ class JoeyApp(QObject):
     def _idle_dismiss(self) -> None:
         if self.hud._state == "listening":
             self.hud.set_state("hidden")
+
+    def _on_dismissed(self) -> None:
+        # ESC / idle / programmatic hide — interrupt TTS and let voice resume.
+        self.worker.cancel()
+        if self.voice is not None:
+            self.voice.signal_cycle_done()
 
 
 def main() -> None:
