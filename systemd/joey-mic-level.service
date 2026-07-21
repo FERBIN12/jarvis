@@ -1,0 +1,16 @@
+[Unit]
+Description=Joey — pin mic volume to a sane level so wake-word doesn't clip
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '\
+  SRC=$$(pactl info | grep "Default Source" | awk "{print \\$3}");\
+  [ -n "$$SRC" ] && pactl set-source-volume "$$SRC" 30%;\
+  pactl set-source-mute "$$SRC" 0;\
+'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

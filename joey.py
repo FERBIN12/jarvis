@@ -1,0 +1,650 @@
+"""Joey — voice agent. Wake word -> Whisper STT -> claude -p -> Piper TTS."""
+from __future__ import annotations
+
+import json
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import wave
+from pathlib import Path
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import webrtcvad
+from faster_whisper import WhisperModel
+from openwakeword.model import Model as WakeWordModel
+
+ROOT = Path(__file__).resolve().parent
+MODELS_DIR = ROOT / "models"
+VOICES_DIR = ROOT / "voices"
+SESSIONS_DIR = ROOT / "sessions"
+SESSIONS_DIR.mkdir(exist_ok=True)
+
+SAMPLE_RATE = 16000
+FRAME_MS = 30
+FRAME_LEN = SAMPLE_RATE * FRAME_MS // 1000  # 480 samples
+# Wake-word sensitivity. 0.5 is openWakeWord's default but is noisy — TV,
+# music, background voices trigger it. 0.65 is a much safer floor. Tune
+# with JOEY_WAKE_THRESHOLD env var without editing code.
+WAKE_THRESHOLD = float(os.environ.get("JOEY_WAKE_THRESHOLD", "0.65"))
+# Require N consecutive frames above threshold to fire — kills one-frame
+# spikes from transient noise (door close, cough, sudden music swell).
+WAKE_CONSECUTIVE_FRAMES = int(os.environ.get("JOEY_WAKE_FRAMES", "2"))
+SILENCE_TIMEOUT_S = 1.5     # stop recording after this much silence
+MAX_UTTERANCE_S = 20.0      # hard cap on one user utterance
+SESSION_IDLE_S = 120.0      # reset conversation after 2 min idle
+WAKE_WORD = "hey jarvis"    # pre-trained; swap to custom "hey joey" later
+
+PIPER_VOICE = VOICES_DIR / "en_US-amy-medium.onnx"
+
+
+def log(msg: str) -> None:
+    print(f"[joey] {msg}", flush=True)
+
+
+class Recorder:
+    """Record one utterance: start at first speech, stop after SILENCE_TIMEOUT_S of silence."""
+
+    def __init__(self) -> None:
+        self.vad = webrtcvad.Vad(2)  # 0-3, higher = more aggressive
+
+    def record(self) -> np.ndarray:
+        frames: list[bytes] = []
+        silence_frames = 0
+        speech_frames = 0
+        started = False
+        max_frames = int(MAX_UTTERANCE_S * 1000 / FRAME_MS)
+        silence_limit = int(SILENCE_TIMEOUT_S * 1000 / FRAME_MS)
+
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=FRAME_LEN,
+            dtype="int16",
+            channels=1,
+        ) as stream:
+            for _ in range(max_frames):
+                data, _ = stream.read(FRAME_LEN)
+                pcm = bytes(data)
+                is_speech = self.vad.is_speech(pcm, SAMPLE_RATE)
+                if is_speech:
+                    started = True
+                    speech_frames += 1
+                    silence_frames = 0
+                    frames.append(pcm)
+                elif started:
+                    frames.append(pcm)
+                    silence_frames += 1
+                    if silence_frames >= silence_limit:
+                        break
+                # before first speech, wait up to ~3s for user to start
+                elif not started and len(frames) == 0:
+                    silence_frames += 1
+                    if silence_frames >= int(3.0 * 1000 / FRAME_MS):
+                        return np.zeros(0, dtype=np.int16)
+
+        if speech_frames < 5:  # less than ~150ms of voiced audio
+            return np.zeros(0, dtype=np.int16)
+        audio = np.frombuffer(b"".join(frames), dtype=np.int16)
+        return audio
+
+
+class WakeWord:
+    def __init__(self) -> None:
+        log("loading wake word model...")
+        self.model = WakeWordModel(
+            wakeword_models=["hey_jarvis"],
+            inference_framework="onnx",
+        )
+
+    def listen(self) -> None:
+        log(f"listening for '{WAKE_WORD}'...")
+        # openwakeword wants 80ms (1280 samples @ 16kHz) chunks for best accuracy
+        chunk = 1280
+        with sd.RawInputStream(
+            samplerate=SAMPLE_RATE,
+            blocksize=chunk,
+            dtype="int16",
+            channels=1,
+        ) as stream:
+            while True:
+                data, _ = stream.read(chunk)
+                pcm = np.frombuffer(bytes(data), dtype=np.int16)
+                preds = self.model.predict(pcm)
+                for name, score in preds.items():
+                    if score >= WAKE_THRESHOLD:
+                        log(f"wake! ({name}={score:.2f})")
+                        # drain a bit to avoid retriggering on the same word
+                        self.model.reset()
+                        return
+
+
+def play_chime(freq: float = 880.0, ms: int = 120) -> None:
+    t = np.linspace(0, ms / 1000.0, int(SAMPLE_RATE * ms / 1000.0), endpoint=False)
+    tone = (np.sin(2 * np.pi * freq * t) * 0.2).astype(np.float32)
+    # fade in/out to avoid clicks
+    fade = int(SAMPLE_RATE * 0.01)
+    tone[:fade] *= np.linspace(0, 1, fade)
+    tone[-fade:] *= np.linspace(1, 0, fade)
+    sd.play(tone, SAMPLE_RATE, blocking=True)
+
+
+class Whisper:
+    def __init__(self) -> None:
+        log("loading whisper base model (cpu/int8)...")
+        self.model = WhisperModel("base.en", device="cpu", compute_type="int8")
+
+    def transcribe(self, audio_int16: np.ndarray) -> str:
+        audio = audio_int16.astype(np.float32) / 32768.0
+        segments, _ = self.model.transcribe(audio, language="en", beam_size=1)
+        return " ".join(s.text for s in segments).strip()
+
+
+class Piper:
+    """Wrap piper-tts via its python API."""
+
+    def __init__(self) -> None:
+        from piper import PiperVoice
+        log(f"loading piper voice from {PIPER_VOICE.name}...")
+        self.voice = PiperVoice.load(str(PIPER_VOICE))
+
+    def speak(self, text: str) -> None:
+        if not text.strip():
+            return
+        chunks = list(self.voice.synthesize(text))
+        if not chunks:
+            return
+        rate = chunks[0].sample_rate
+        audio = np.concatenate([c.audio_float_array for c in chunks])
+        sd.play(audio, rate, blocking=True)
+
+
+class ClaudeBrain:
+    """Talk to Claude Code in headless mode, with persistent session id."""
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.last_used: float = 0.0
+
+    def _maybe_reset(self) -> None:
+        if self.session_id and (time.time() - self.last_used) > SESSION_IDLE_S:
+            log("session timed out — starting fresh.")
+            self.session_id = None
+
+    def ask(self, user_text: str) -> str:
+        self._maybe_reset()
+        cmd = ["claude", "-p", "--output-format", "json"]
+        if self.session_id:
+            cmd += ["--resume", self.session_id]
+        cmd += [user_text]
+        log(f"$ {' '.join(cmd[:-1])} <prompt>")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return "Claude timed out, sorry."
+        if proc.returncode != 0:
+            return f"Claude error: {proc.stderr.strip()[:200]}"
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return proc.stdout.strip()[:500]
+        sid = data.get("session_id") or data.get("sessionId")
+        if sid:
+            self.session_id = sid
+        self.last_used = time.time()
+        return data.get("result") or data.get("response") or "(no response)"
+
+
+class HermesAPIBrain:
+    """Direct HTTPS calls to Nous Portal inference API (the same backend
+    `hermes -z` uses, but without the 5-7s Python CLI cold-start per turn).
+
+    Reads the agent_key from ~/.hermes/auth.json (Hermes CLI keeps it
+    refreshed in the background; we just consume what's there). Falls back
+    to spawning `hermes status` once if we hit a 401, to nudge a refresh.
+
+    Maintains conversation history in-process for multi-turn memory."""
+
+    AUTH_PATH = Path.home() / ".hermes" / "auth.json"
+    CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+    DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
+    IDLE_S = 180.0
+    MAX_TOKENS = 1024
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+        self.last_used = 0.0
+        self._model: str | None = None
+
+    def _resolve_model(self) -> str:
+        if self._model is not None:
+            return self._model
+        # Honor hermes config model.default if set
+        try:
+            import yaml  # PySide6 brings yaml in transitively; falls back gracefully
+            if self.CONFIG_PATH.exists():
+                cfg = yaml.safe_load(self.CONFIG_PATH.read_text()) or {}
+                m = (cfg.get("model") or {}).get("default")
+                if m:
+                    self._model = m
+                    return m
+        except Exception:
+            pass
+        self._model = self.DEFAULT_MODEL
+        return self._model
+
+    def _load_auth(self) -> dict:
+        with open(self.AUTH_PATH) as f:
+            return json.load(f)["providers"]["nous"]
+
+    def _refresh_via_hermes(self) -> None:
+        """Last-resort 401 recovery: kick hermes to mint a fresh agent_key.
+        Amortized — only happens when the cached key expires (~daily)."""
+        try:
+            subprocess.run(["hermes", "status"], capture_output=True, timeout=20)
+        except Exception:
+            pass
+
+    def _post_chat(self, payload: dict) -> dict:
+        import urllib.error
+        import urllib.request
+
+        def _do():
+            auth = self._load_auth()
+            req = urllib.request.Request(
+                auth["inference_base_url"] + "/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {auth['agent_key']}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return json.loads(resp.read().decode())
+
+        try:
+            return _do()
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            log("brain: 401 — refreshing agent_key via hermes status…")
+            self._refresh_via_hermes()
+            return _do()
+
+    def ask(self, user_text: str) -> str:
+        # Non-streaming convenience; collect all chunks.
+        return "".join(self.ask_stream(user_text)) or "(empty reply)"
+
+    def ask_stream(self, user_text: str):
+        """Yield incremental reply chunks (strings) as they arrive from the
+        model. Callers can dispatch each completed sentence to TTS the moment
+        it's ready, so audio can start before the model finishes thinking."""
+        import urllib.error
+        import urllib.request
+
+        if self.messages and (time.time() - self.last_used) > self.IDLE_S:
+            log("brain: idle reset, fresh session.")
+            self.messages = []
+        self.messages.append({"role": "user", "content": user_text})
+        model = self._resolve_model()
+        log(f"$ POST chat/completions (stream)  model={model}  msgs={len(self.messages)}")
+        payload = {
+            "model": model,
+            "messages": self.messages,
+            "max_tokens": self.MAX_TOKENS,
+            "stream": True,
+        }
+
+        def _do_stream():
+            auth = self._load_auth()
+            req = urllib.request.Request(
+                auth["inference_base_url"] + "/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {auth['agent_key']}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                },
+                method="POST",
+            )
+            return urllib.request.urlopen(req, timeout=60)
+
+        t0 = time.time()
+        reply_parts: list[str] = []
+        try:
+            try:
+                resp = _do_stream()
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    log("brain: 401 — refreshing agent_key via hermes status…")
+                    self._refresh_via_hermes()
+                    resp = _do_stream()
+                else:
+                    raise
+            first_chunk_t: float | None = None
+            with resp:
+                for raw in resp:
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload_str = line[5:].strip()
+                    if payload_str == "[DONE]":
+                        break
+                    try:
+                        ev = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    try:
+                        delta = ev["choices"][0].get("delta") or {}
+                    except (KeyError, IndexError):
+                        continue
+                    chunk = delta.get("content")
+                    if not chunk:
+                        continue
+                    if first_chunk_t is None:
+                        first_chunk_t = time.time()
+                        log(f"brain: first token at {first_chunk_t - t0:.2f}s")
+                    reply_parts.append(chunk)
+                    yield chunk
+        except Exception as e:
+            self.messages.pop()  # rollback
+            yield f"(API error: {e})"
+            return
+
+        full = "".join(reply_parts)
+        log(f"brain: total {time.time() - t0:.2f}s  ({len(full)} chars)")
+        self.messages.append({"role": "assistant", "content": full})
+        self.last_used = time.time()
+
+
+class OpenClawBrain:
+    """Routes Jarvis through the user's OpenClaw gateway — same brain as
+    other channels they wire to it (Discord, WhatsApp, etc), and benefits
+    from OpenClaw's multi-model routing / agent ecosystem.
+
+    OpenClaw's `infer model run --gateway` path is stateless one-shot, so
+    multi-turn memory is handled here by inlining recent history into the
+    prompt. Default model is Haiku 4.5 (override with JOEY_OPENCLAW_MODEL).
+    """
+
+    DEFAULT_MODEL = "anthropic/claude-haiku-4-5"
+    IDLE_S = 180.0
+    HISTORY_MAX_PAIRS = 6
+
+    def __init__(self) -> None:
+        self.history: list[tuple[str, str]] = []  # (user, reply) pairs
+        self.last_used = 0.0
+        self.bin = self._resolve_binary()
+        log(f"OpenClawBrain: using {self.bin}")
+
+    @staticmethod
+    def _resolve_binary() -> str:
+        """Find openclaw regardless of systemd PATH stripping. Searches
+        PATH first, then common nvm/npm-global locations."""
+        import shutil
+        from pathlib import Path
+        found = shutil.which("openclaw")
+        if found:
+            return found
+        candidates = [
+            Path.home() / ".local" / "bin" / "openclaw",
+        ]
+        nvm = Path.home() / ".nvm" / "versions" / "node"
+        if nvm.exists():
+            for ver_dir in sorted(nvm.iterdir(), reverse=True):
+                cand = ver_dir / "bin" / "openclaw"
+                if cand.exists():
+                    candidates.append(cand)
+        for c in candidates:
+            if c.exists():
+                return str(c)
+        # Fall back — subprocess will surface a clear error
+        return "openclaw"
+
+    def _build_prompt(self, user_text: str) -> str:
+        if not self.history:
+            return user_text
+        recent = self.history[-self.HISTORY_MAX_PAIRS:]
+        block = "\n\n".join(f"User: {u}\nAssistant: {r}" for u, r in recent)
+        return f"Conversation so far:\n{block}\n\nUser: {user_text}\nAssistant:"
+
+    def ask(self, user_text: str) -> str:
+        if self.history and (time.time() - self.last_used) > self.IDLE_S:
+            log("brain: idle reset.")
+            self.history = []
+        model = os.environ.get("JOEY_OPENCLAW_MODEL", self.DEFAULT_MODEL)
+        cmd = [
+            self.bin, "infer", "model", "run",
+            "--gateway",
+            "--model", model,
+            "--prompt", self._build_prompt(user_text),
+            "--json",
+        ]
+        log(f"$ openclaw infer model run  model={model}")
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            return "OpenClaw timed out."
+        if proc.returncode != 0:
+            return f"OpenClaw error: {proc.stderr.strip()[:300]}"
+        # openclaw prints config warnings to stdout before the JSON object;
+        # strip everything before the first '{' on its own line.
+        out = proc.stdout
+        brace = out.find("\n{")
+        if brace != -1:
+            out = out[brace + 1:]
+        try:
+            data = json.loads(out)
+            text = data.get("outputs", [{}])[0].get("text", "") or ""
+        except Exception as e:
+            return f"OpenClaw parse error: {e}; raw={out[:200]}"
+        log(f"brain: {time.time() - t0:.2f}s  ({len(text)} chars)")
+        self.history.append((user_text, text))
+        self.last_used = time.time()
+        return text or "(empty reply)"
+
+
+class ClaudeCodeBrain:
+    """Full-power Claude Code brain — streams via `--output-format stream-json`
+    AND has the full agent toolset (Read / Write / Edit / Bash / Glob / Grep
+    + any MCP servers the user has configured + skills).
+
+    Filesystem access: home directory by default (override with
+    JOEY_CLAUDE_DIRS=~/joey:~/project_mdds:...). Runs with
+    `--permission-mode bypassPermissions` so Joey doesn't deadlock on
+    permission prompts. **This means Jarvis can read, edit, delete, and
+    run shell commands anywhere your user can.** That's the explicit
+    design choice — Jarvis is meant to be an agent, not a chatbot.
+
+    Multi-turn handled by capturing session_id and passing `--resume <id>`
+    on follow-up calls. Conversation memory persists across turns; new
+    session every 3 min of idle.
+    """
+
+    DEFAULT_MODEL = "haiku"  # JOEY_CLAUDE_MODEL=sonnet for heavier tasks
+    DEFAULT_EFFORT = "low"   # JOEY_CLAUDE_EFFORT=medium for tougher tool use
+    IDLE_S = 180.0
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.last_used: float = 0.0
+
+    def _maybe_reset(self) -> None:
+        if self.session_id and (time.time() - self.last_used) > self.IDLE_S:
+            log("brain: idle reset, fresh session.")
+            self.session_id = None
+
+    def _allowed_dirs(self) -> list[str]:
+        # JOEY_CLAUDE_DIRS is a colon-separated list of dirs Jarvis can touch.
+        # Default = the user's entire home directory.
+        raw = os.environ.get("JOEY_CLAUDE_DIRS", str(Path.home()))
+        return [d for d in raw.split(":") if d]
+
+    def ask(self, user_text: str) -> str:
+        return "".join(self.ask_stream(user_text)) or "(empty reply)"
+
+    def ask_stream(self, user_text: str):
+        self._maybe_reset()
+        model = os.environ.get("JOEY_CLAUDE_MODEL", self.DEFAULT_MODEL)
+        effort = os.environ.get("JOEY_CLAUDE_EFFORT", self.DEFAULT_EFFORT)
+        # IMPORTANT: --add-dir is variadic — it absorbs every positional arg
+        # until the NEXT flag. If we put it last before the prompt, the prompt
+        # is parsed as another directory and claude errors with "Input must be
+        # provided…". So put --add-dir FIRST, followed by other flags.
+        cmd = ["claude", "-p"]
+        for d in self._allowed_dirs():
+            cmd += ["--add-dir", d]
+        cmd += [
+            "--model", model,
+            "--effort", effort,
+            "--output-format", "stream-json",
+            "--include-partial-messages",
+            "--verbose",
+            "--permission-mode", "bypassPermissions",
+        ]
+        if self.session_id:
+            cmd += ["--resume", self.session_id]
+        cmd.append(user_text)
+        log(f"$ claude -p stream  model={model}  effort={effort}  "
+            f"dirs={self._allowed_dirs()}  "
+            f"{'resume' if self.session_id else 'new'}")
+
+        t0 = time.time()
+        # Run from $HOME so Claude's working directory makes file paths sane
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            cwd=str(Path.home()),
+        )
+        first_text_t: float | None = None
+        full_text_parts: list[str] = []
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = ev.get("session_id")
+                if sid:
+                    self.session_id = sid
+                if ev.get("type") == "stream_event":
+                    inner = ev.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            chunk = delta.get("text", "")
+                            if chunk:
+                                if first_text_t is None:
+                                    first_text_t = time.time()
+                                    log(f"brain: first text at {first_text_t - t0:.2f}s")
+                                full_text_parts.append(chunk)
+                                yield chunk
+                elif ev.get("type") == "result":
+                    # final summary — capture session_id (already done above)
+                    pass
+            proc.wait(timeout=30)
+        except Exception as e:
+            log(f"brain stream error: {e!r}")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        log(f"brain: total {time.time() - t0:.2f}s  "
+            f"({sum(len(p) for p in full_text_parts)} chars)")
+        self.last_used = time.time()
+
+
+class HermesBrain:
+    """Original `hermes -z` subprocess path — kept as fallback. Slower
+    (~5-10s per turn) because hermes is a heavy Python CLI that cold-starts
+    every call. Prefer HermesAPIBrain."""
+
+    HERMES_IDLE_S = 180.0  # 3 min between turns before starting fresh
+
+    def __init__(self) -> None:
+        self.has_session = False
+        self.last_used = 0.0
+
+    def _maybe_reset(self) -> None:
+        if self.has_session and (time.time() - self.last_used) > self.HERMES_IDLE_S:
+            log("hermes session idle — starting fresh.")
+            self.has_session = False
+
+    def ask(self, user_text: str) -> str:
+        self._maybe_reset()
+        cmd = ["hermes", "-z", user_text]
+        if self.has_session:
+            cmd.append("--continue")
+        log(f"$ hermes -z <prompt>{' --continue' if self.has_session else ''}")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return "Hermes timed out, sorry."
+        if proc.returncode != 0:
+            return f"Hermes error: {proc.stderr.strip()[:200]}"
+        self.has_session = True
+        self.last_used = time.time()
+        return proc.stdout.strip() or "(no response)"
+
+
+def main() -> None:
+    if not PIPER_VOICE.exists():
+        log(f"ERROR: piper voice not found at {PIPER_VOICE}")
+        log("run: bash scripts/download_models.sh first")
+        sys.exit(1)
+
+    wake = WakeWord()
+    rec = Recorder()
+    whisper = Whisper()
+    piper = Piper()
+    brain = ClaudeBrain()
+
+    log("joey ready.")
+    while True:
+        try:
+            wake.listen()
+            play_chime(880, 100)
+            audio = rec.record()
+            if audio.size == 0:
+                log("no speech detected.")
+                continue
+            user_text = whisper.transcribe(audio)
+            if not user_text:
+                log("whisper returned empty transcript.")
+                continue
+            log(f"USER: {user_text}")
+            response = brain.ask(user_text)
+            log(f"CLAUDE: {response}")
+            piper.speak(response)
+        except KeyboardInterrupt:
+            log("bye.")
+            return
+        except Exception as e:
+            log(f"loop error: {e!r}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
